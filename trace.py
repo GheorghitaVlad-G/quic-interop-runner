@@ -79,13 +79,16 @@ def get_packet_type(p) -> PacketType:
 
 class TraceAnalyzer:
     _filename = ""
+    _protocol = "quic"
 
-    def __init__(self, filename: str, keylog_file: Optional[str] = None):
+    def __init__(self, filename: str, keylog_file: Optional[str] = None, protocol: str = "quic"):
         self._filename = filename
         self._keylog_file = keylog_file
+        self._protocol = protocol
 
     def _get_direction_filter(self, d: Direction) -> str:
-        f = "(quic && !icmp) && "
+        proto = "quic" if self._protocol == "quic" else "tcp"
+        f = f"({proto} && !icmp) && "
         if d == Direction.FROM_CLIENT:
             return (
                 f + "(ip.src==" + IP4_CLIENT + " || ipv6.src==" + IP6_CLIENT + ") && "
@@ -131,7 +134,8 @@ class TraceAnalyzer:
 
     def get_raw_packets(self, direction: Direction = Direction.ALL) -> List:
         packets = []
-        for packet in self._get_packets(self._get_direction_filter(direction) + "quic"):
+        proto = "quic" if self._protocol == "quic" else "tcp"
+        for packet in self._get_packets(self._get_direction_filter(direction) + proto):
             packets.append(packet)
         return packets
 
@@ -143,22 +147,31 @@ class TraceAnalyzer:
     def get_1rtt_sniff_times(
         self, direction: Direction = Direction.ALL
     ) -> Tuple[List, datetime.datetime, datetime.datetime]:
-        """Get all QUIC packets, one or both directions, and first and last sniff times."""
+        """Get all data packets, one or both directions, and first and last sniff times."""
         packets = []
         first, last = 0, 0
-        for packet in self._get_packets(
-            self._get_direction_filter(direction) + "quic.header_form==0"
-        ):
+        filter = self._get_direction_filter(direction)
+        if self._protocol == "quic":
+            filter += "quic.header_form==0"
+        else:
+            filter += "tcp.len > 0"
+        for packet in self._get_packets(filter):
             for layer in packet.layers:
-                if (
-                    layer.layer_name == "quic"
-                    and not hasattr(layer, "long_packet_type")
-                    and not hasattr(layer, "long_packet_type_v2")
-                ):
-                    if first == 0:
-                        first = packet.sniff_time
-                    last = packet.sniff_time
-                    packets.append(layer)
+                if layer.layer_name == self._protocol:
+                    if self._protocol == "quic":
+                        if (
+                            not hasattr(layer, "long_packet_type")
+                            and not hasattr(layer, "long_packet_type_v2")
+                        ):
+                            if first == 0:
+                                first = packet.sniff_time
+                            last = packet.sniff_time
+                            packets.append(layer)
+                    else:
+                        if first == 0:
+                            first = packet.sniff_time
+                        last = packet.sniff_time
+                        packets.append(layer)
         return packets, first, last
 
     def get_vnp(self, direction: Direction = Direction.ALL) -> List:

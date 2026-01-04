@@ -45,6 +45,8 @@ class InteropRunner:
     _log_dir = ""
     _save_files = False
     _no_auto_unsupported = []
+    _protocol = "quic"
+    _scenario = "simple"
 
     def __init__(
         self,
@@ -58,6 +60,8 @@ class InteropRunner:
         save_files=False,
         log_dir="",
         no_auto_unsupported=[],
+        protocol="quic",
+        scenario="simple",
     ):
         logger = logging.getLogger()
         logger.setLevel(logging.DEBUG)
@@ -77,6 +81,8 @@ class InteropRunner:
         self._log_dir = log_dir
         self._save_files = save_files
         self._no_auto_unsupported = no_auto_unsupported
+        self._protocol = protocol
+        self._scenario = scenario
         if len(self._log_dir) == 0:
             self._log_dir = "logs_{:%Y-%m-%dT%H:%M:%S}".format(self._start_time)
         if os.path.exists(self._log_dir):
@@ -384,6 +390,7 @@ class InteropRunner:
             sim_log_dir=sim_log_dir,
             client_keylog_file=client_log_dir.name + "/keys.log",
             server_keylog_file=server_log_dir.name + "/keys.log",
+            protocol=self._protocol,
         )
         print(
             "Server: "
@@ -396,8 +403,10 @@ class InteropRunner:
 
         reqs = " ".join([testcase.urlprefix() + p for p in testcase.get_paths()])
         logging.debug("Requests: %s", reqs)
+        port = "443" if self._protocol == "quic" else "80"
         params = (
-            "WAITFORSERVER=server:443 "
+            "PROTOCOL=" + self._protocol + " "
+            "WAITFORSERVER=server:" + port + " "
             "CERTS=" + testcase.certs_dir() + " "
             "TESTCASE_SERVER=" + testcase.testname(Perspective.SERVER) + " "
             "TESTCASE_CLIENT=" + testcase.testname(Perspective.CLIENT) + " "
@@ -409,7 +418,7 @@ class InteropRunner:
             "CLIENT=" + self._implementations[client]["image"] + " "
             "SERVER=" + self._implementations[server]["image"] + " "
             'REQUESTS="' + reqs + '" '
-        ).format(testcase.scenario())
+        ).format(self._scenario)
         params += " ".join(testcase.additional_envs())
         containers = "sim client server " + " ".join(testcase.additional_containers())
         cmd = (

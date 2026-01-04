@@ -83,6 +83,18 @@ def main():
             "--no-auto-unsupported",
             help="implementations for which auto-marking as unsupported when all tests fail should be skipped",
         )
+        parser.add_argument(
+            "-p",
+            "--protocol",
+            help="protocol to test (quic or tcp)",
+            default="quic",
+        )
+        parser.add_argument(
+            "-sc",
+            "--scenario",
+            help="network scenario for the simulator",
+            default="simple",
+        )
         return parser.parse_args()
 
     replace_arg = get_args().replace
@@ -95,6 +107,23 @@ def main():
             if name not in IMPLEMENTATIONS:
                 sys.exit("Implementation " + name + " not found.")
             implementations[name]["image"] = image
+
+    protocol = get_args().protocol
+    client_implementations_filtered = [
+        name
+        for name in client_implementations
+        if IMPLEMENTATIONS[name]["protocol"] == protocol
+    ]
+    server_implementations_filtered = [
+        name
+        for name in server_implementations
+        if IMPLEMENTATIONS[name]["protocol"] == protocol
+    ]
+    implementations_filtered = {
+        name: value
+        for name, value in implementations.items()
+        if IMPLEMENTATIONS[name]["protocol"] == protocol
+    }
 
     def get_impls(arg, availableImpls, role) -> List[str]:
         if not arg:
@@ -152,15 +181,15 @@ def main():
         return tests, measurements
 
     t = get_tests_and_measurements(get_args().test)
-    clients = get_impls(get_args().client, client_implementations, "Client")
-    servers = get_impls(get_args().server, server_implementations, "Server")
+    clients = get_impls(get_args().client, client_implementations_filtered, "Client")
+    servers = get_impls(get_args().server, server_implementations_filtered, "Server")
     # If there is only one client or server, we should not automatically mark tests as unsupported
     no_auto_unsupported = set()
     for kind in [clients, servers]:
         if len(kind) == 1:
             no_auto_unsupported.add(kind[0])
     return InteropRunner(
-        implementations=implementations,
+        implementations=implementations_filtered,
         client_server_pairs=get_impl_pairs(clients, servers, get_args().must_include),
         tests=t[0],
         measurements=t[1],
@@ -176,6 +205,8 @@ def main():
                 get_args().no_auto_unsupported, clients + servers, "Client/Server"
             )
         ),
+        protocol=protocol,
+        scenario=get_args().scenario,
     ).run()
 
 

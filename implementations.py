@@ -13,7 +13,7 @@ class Role(Enum):
 with open("implementations.json", "r") as f:
     data = json.load(f)
     for name, val in data.items():
-        IMPLEMENTATIONS[name] = {"image": val["image"], "url": val["url"]}
+        IMPLEMENTATIONS[name] = {"image": val["image"], "url": val["url"], "protocol": val.get("protocol", "quic")}
         role = val["role"]
         if role == "server":
             IMPLEMENTATIONS[name]["role"] = Role.SERVER

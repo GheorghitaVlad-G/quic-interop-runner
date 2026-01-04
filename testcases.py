@@ -78,11 +78,22 @@ class TestCase(abc.ABC):
         sim_log_dir: tempfile.TemporaryDirectory,
         client_keylog_file: str,
         server_keylog_file: str,
+        protocol: str = "quic",
+    ):
+        self.setup(sim_log_dir, client_keylog_file, server_keylog_file, protocol)
+
+    def setup(
+        self,
+        sim_log_dir: tempfile.TemporaryDirectory,
+        client_keylog_file: str,
+        server_keylog_file: str,
+        protocol: str = "quic",
     ):
         self._server_keylog_file = server_keylog_file
         self._client_keylog_file = client_keylog_file
         self._files = []
         self._sim_log_dir = sim_log_dir
+        self._protocol = protocol
 
     @abc.abstractmethod
     def name(self):
@@ -109,10 +120,12 @@ class TestCase(abc.ABC):
         """timeout in s"""
         return 60
 
-    @staticmethod
-    def urlprefix() -> str:
+    def urlprefix(self) -> str:
         """URL prefix"""
-        return "https://server4:443/"
+        if self._protocol == "quic":
+            return "https://server4:443/"
+        else:
+            return "http://server4:80/"
 
     @staticmethod
     def additional_envs() -> List[str]:
@@ -184,14 +197,14 @@ class TestCase(abc.ABC):
         if self._cached_client_trace is None:
             trace = self._sim_log_dir.name + "/trace_node_left.pcap"
             self._inject_keylog_if_possible(trace)
-            self._cached_client_trace = TraceAnalyzer(trace, self._keylog_file())
+            self._cached_client_trace = TraceAnalyzer(trace, self._keylog_file(), self._protocol)
         return self._cached_client_trace
 
     def _server_trace(self):
         if self._cached_server_trace is None:
             trace = self._sim_log_dir.name + "/trace_node_right.pcap"
             self._inject_keylog_if_possible(trace)
-            self._cached_server_trace = TraceAnalyzer(trace, self._keylog_file())
+            self._cached_server_trace = TraceAnalyzer(trace, self._keylog_file(), self._protocol)
         return self._cached_server_trace
 
     def _generate_random_file(self, size: int, filename: str = None) -> str:
