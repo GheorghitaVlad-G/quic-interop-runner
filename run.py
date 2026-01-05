@@ -95,9 +95,43 @@ def main():
             help="network scenario for the simulator",
             default="simple",
         )
+        parser.add_argument(
+            "--delay",
+            help="network delay (e.g., 15ms)",
+            default="15ms",
+        )
+        parser.add_argument(
+            "--bandwidth",
+            help="network bandwidth (e.g., 10Mbps)",
+            default="10Mbps",
+        )
+        parser.add_argument(
+            "--queue",
+            help="queue size in packets",
+            default="25",
+        )
+        parser.add_argument(
+            "--loss-rate",
+            help="packet loss rate in percent (0-100), enables drop-rate scenario",
+            type=int,
+            default=None,
+        )
+        parser.add_argument(
+            "--corrupt-rate",
+            help="packet corruption rate in percent (0-100), enables corrupt-rate scenario",
+            type=int,
+            default=None,
+        )
+        parser.add_argument(
+            "--burst-size",
+            help="burst size for packet loss or corruption",
+            type=int,
+            default=None,
+        )
         return parser.parse_args()
 
-    replace_arg = get_args().replace
+    args = get_args()
+    replace_arg = args.replace
     if replace_arg:
         for s in replace_arg.split(","):
             pair = s.split("=")
@@ -108,7 +142,18 @@ def main():
                 sys.exit("Implementation " + name + " not found.")
             implementations[name]["image"] = image
 
-    protocol = get_args().protocol
+    # Set network parameters
+    import testcases
+    testcases.network_params.update({
+        'delay': args.delay,
+        'bandwidth': args.bandwidth,
+        'queue': args.queue,
+        'loss_rate': args.loss_rate,
+        'corrupt_rate': args.corrupt_rate,
+        'burst_size': args.burst_size,
+    })
+
+    protocol = args.protocol
     client_implementations_filtered = [
         name
         for name in client_implementations
@@ -180,9 +225,9 @@ def main():
                 sys.exit()
         return tests, measurements
 
-    t = get_tests_and_measurements(get_args().test)
-    clients = get_impls(get_args().client, client_implementations_filtered, "Client")
-    servers = get_impls(get_args().server, server_implementations_filtered, "Server")
+    t = get_tests_and_measurements(args.test)
+    clients = get_impls(args.client, client_implementations_filtered, "Client")
+    servers = get_impls(args.server, server_implementations_filtered, "Server")
     # If there is only one client or server, we should not automatically mark tests as unsupported
     no_auto_unsupported = set()
     for kind in [clients, servers]:
@@ -190,23 +235,23 @@ def main():
             no_auto_unsupported.add(kind[0])
     return InteropRunner(
         implementations=implementations_filtered,
-        client_server_pairs=get_impl_pairs(clients, servers, get_args().must_include),
+        client_server_pairs=get_impl_pairs(clients, servers, args.must_include),
         tests=t[0],
         measurements=t[1],
-        output=get_args().json,
-        markdown=get_args().markdown,
-        debug=get_args().debug,
-        log_dir=get_args().log_dir,
-        save_files=get_args().save_files,
+        output=args.json,
+        markdown=args.markdown,
+        debug=args.debug,
+        log_dir=args.log_dir,
+        save_files=args.save_files,
         no_auto_unsupported=(
             no_auto_unsupported
-            if get_args().no_auto_unsupported is None
+            if args.no_auto_unsupported is None
             else get_impls(
-                get_args().no_auto_unsupported, clients + servers, "Client/Server"
+                args.no_auto_unsupported, clients + servers, "Client/Server"
             )
         ),
         protocol=protocol,
-        scenario=get_args().scenario,
+        scenario=args.scenario,
     ).run()
 
 

@@ -1,6 +1,6 @@
 {
   "quic-go": {
-    "image": "martenseemann/quic-go-interop:latest",
+    "image": "custom-quic-network-simulator:latest",
     "url": "https://github.com/quic-go/quic-go",
     "role": "both",
     "protocol": "quic"
@@ -102,13 +102,13 @@
     "protocol": "quic"
   },
   "tcp-server": {
-    "image": "nginx:alpine",
+    "image": "tcp-server:latest",
     "url": "https://nginx.org/",
     "role": "server",
     "protocol": "tcp"
   },
   "tcp-client": {
-    "image": "curlimages/curl:latest",
+    "image": "tcp-client:latest",
     "url": "https://curl.se/",
     "role": "client",
     "protocol": "tcp"

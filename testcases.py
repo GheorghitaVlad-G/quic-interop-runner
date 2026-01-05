@@ -32,6 +32,16 @@ MB = 1 << 20
 QUIC_DRAFT = 34  # draft-34
 QUIC_VERSION = hex(0x1)
 
+# Global network parameters for simulation
+network_params = {
+    'delay': '15ms',
+    'bandwidth': '10Mbps',
+    'queue': '25',
+    'loss_rate': None,  # if set, use drop-rate scenario
+    'corrupt_rate': None,
+    'burst_size': None,
+}
+
 
 class Perspective(Enum):
     SERVER = "server"
@@ -113,7 +123,17 @@ class TestCase(abc.ABC):
     @staticmethod
     def scenario() -> str:
         """Scenario for the ns3 simulator"""
-        return "simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25"
+        if network_params['burst_size'] is None and (network_params['loss_rate'] or network_params['corrupt_rate']):
+            network_params['burst_size'] = 3
+        if network_params['loss_rate'] and network_params['corrupt_rate']:
+            # If both are set, use drop-rate (loss takes priority)
+            return f"drop-rate --delay={network_params['delay']} --bandwidth={network_params['bandwidth']} --queue={network_params['queue']} --rate_to_server={network_params['loss_rate']} --rate_to_client={network_params['loss_rate']} --burst_to_server={network_params['burst_size']} --burst_to_client={network_params['burst_size']}"
+        elif network_params['loss_rate']:
+            return f"drop-rate --delay={network_params['delay']} --bandwidth={network_params['bandwidth']} --queue={network_params['queue']} --rate_to_server={network_params['loss_rate']} --rate_to_client={network_params['loss_rate']} --burst_to_server={network_params['burst_size']} --burst_to_client={network_params['burst_size']}"
+        elif network_params['corrupt_rate']:
+            return f"corrupt-rate --delay={network_params['delay']} --bandwidth={network_params['bandwidth']} --queue={network_params['queue']} --rate_to_server={network_params['corrupt_rate']} --rate_to_client={network_params['corrupt_rate']} --burst_to_server={network_params['burst_size']} --burst_to_client={network_params['burst_size']}"
+        else:
+            return f"simple-p2p --delay={network_params['delay']} --bandwidth={network_params['bandwidth']} --queue={network_params['queue']}"
 
     @staticmethod
     def timeout() -> int:
@@ -1644,13 +1664,27 @@ class MeasurementGoodput(Measurement):
 
     def check(self) -> TestResult:
         super().check()
-        num_handshakes = self._count_handshakes()
+        
+        # Handle handshake counting differently for TCP vs QUIC
+        if self._protocol == "tcp":
+            num_handshakes = 1  # TCP always has one connection
+        else:
+            num_handshakes = self._count_handshakes()
+            
         if num_handshakes != 1:
             logging.info("Expected exactly 1 handshake. Got: %d", num_handshakes)
             return TestResult.FAILED
-        if not self._check_version_and_files():
-            return TestResult.FAILED
+        
+        # Handle version checking - only for QUIC
+        if self._protocol == "quic":
+            if not self._check_version_and_files():
+                return TestResult.FAILED
+        else:
+            # For TCP, just check files
+            if not self._check_files():
+                return TestResult.FAILED
 
+        # This now works for both TCP and QUIC thanks to updated trace.py
         packets, first, last = self._client_trace().get_1rtt_sniff_times(
             Direction.FROM_SERVER
         )
@@ -1660,7 +1694,7 @@ class MeasurementGoodput(Measurement):
         time = (last - first) / timedelta(milliseconds=1)
         goodput = (8 * self.FILESIZE) / time
         logging.debug(
-            "Transfering %d MB took %d ms. Goodput: %d kbps",
+            "Transferring %d MB took %d ms. Goodput: %d kbps",
             self.FILESIZE / MB,
             time,
             goodput,

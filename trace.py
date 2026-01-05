@@ -108,23 +108,23 @@ class TraceAnalyzer:
             self._filename,
             display_filter=f,
             override_prefs=override_prefs,
-            disable_protocol="http3",  # see https://github.com/quic-interop/quic-interop-runner/pull/179
+            disable_protocol="http3",
             decode_as={"udp.port==443": "quic"},
         )
         packets = []
-        # If the pcap has been cut short in the middle of the packet, pyshark will crash.
-        # See https://github.com/KimiNewt/pyshark/issues/390.
         try:
             for p in cap:
-                if "quic" not in p:
-                    logging.info("Captured packet without quic layer: %r", p)
+                # For TCP protocol, check for tcp layer instead of quic
+                expected_layer = "tcp" if self._protocol == "tcp" else "quic"
+                if expected_layer not in p:
+                    logging.debug("Captured packet without %s layer: %r", expected_layer, p)
                     continue
                 packets.append(p)
         except Exception as e:
             logging.debug(e)
         cap.close()
 
-        if self._keylog_file is not None:
+        if self._keylog_file is not None and self._protocol == "quic":
             for p in packets:
                 if hasattr(p["quic"], "decryption_failed"):
                     logging.info("At least one QUIC packet could not be decrypted")
@@ -155,6 +155,56 @@ class TraceAnalyzer:
             filter += "quic.header_form==0"
         else:
             filter += "tcp.len > 0"
+        
+        # For TCP, use tshark directly for much faster processing
+        if self._protocol == "tcp":
+            import subprocess
+            import datetime
+            try:
+                # Use tshark to extract just the timestamps we need (much faster than pyshark)
+                cmd = [
+                    "tshark",
+                    "-r", self._filename,
+                    "-Y", filter,
+                    "-T", "fields",
+                    "-e", "frame.time_epoch"
+                ]
+                
+                logging.debug("Running tshark with filter: %s", filter)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                
+                if result.returncode != 0:
+                    logging.error("tshark failed: %s", result.stderr)
+                    return packets, first, last
+                
+                timestamps = []
+                for line in result.stdout.strip().split('\n'):
+                    if line:
+                        try:
+                            timestamps.append(float(line))
+                        except ValueError:
+                            continue
+                
+                if len(timestamps) < 2:
+                    logging.info("Not enough TCP packets found")
+                    return packets, first, last
+                
+                # Convert to datetime objects
+                first = datetime.datetime.fromtimestamp(timestamps[0])
+                last = datetime.datetime.fromtimestamp(timestamps[-1])
+                
+                logging.debug("Read %d TCP data packets (fast method)", len(timestamps))
+                # We don't need the actual packet objects for timing, just return empty list
+                return packets, first, last
+                
+            except subprocess.TimeoutExpired:
+                logging.error("tshark timed out")
+                return packets, first, last
+            except Exception as e:
+                logging.error("Error running tshark: %s", e)
+                return packets, first, last
+        
+        # Original QUIC logic
         for packet in self._get_packets(filter):
             for layer in packet.layers:
                 if layer.layer_name == self._protocol:
@@ -167,11 +217,6 @@ class TraceAnalyzer:
                                 first = packet.sniff_time
                             last = packet.sniff_time
                             packets.append(layer)
-                    else:
-                        if first == 0:
-                            first = packet.sniff_time
-                        last = packet.sniff_time
-                        packets.append(layer)
         return packets, first, last
 
     def get_vnp(self, direction: Direction = Direction.ALL) -> List:

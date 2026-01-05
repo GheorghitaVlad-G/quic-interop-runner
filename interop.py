@@ -105,6 +105,10 @@ class InteropRunner:
 
     def _check_impl_is_compliant(self, name: str) -> bool:
         """check if an implementation return UNSUPPORTED for unknown test cases"""
+        logging.debug("Protocol: %s", self._protocol)
+        if self._protocol == "tcp":
+            # TCP implementations are generic and don't support testcase-specific exit codes
+            return True
         if name in self.compliant:
             logging.debug(
                 "%s already tested for compliance: %s", name, str(self.compliant)
@@ -404,9 +408,10 @@ class InteropRunner:
         reqs = " ".join([testcase.urlprefix() + p for p in testcase.get_paths()])
         logging.debug("Requests: %s", reqs)
         port = "443" if self._protocol == "quic" else "80"
+        waitforserver = "WAITFORSERVER=server:" + port + " " if self._protocol == "quic" else ""
         params = (
             "PROTOCOL=" + self._protocol + " "
-            "WAITFORSERVER=server:" + port + " "
+            + waitforserver +
             "CERTS=" + testcase.certs_dir() + " "
             "TESTCASE_SERVER=" + testcase.testname(Perspective.SERVER) + " "
             "TESTCASE_CLIENT=" + testcase.testname(Perspective.CLIENT) + " "
@@ -418,7 +423,7 @@ class InteropRunner:
             "CLIENT=" + self._implementations[client]["image"] + " "
             "SERVER=" + self._implementations[server]["image"] + " "
             'REQUESTS="' + reqs + '" '
-        ).format(self._scenario)
+        ).format(testcase.scenario())
         params += " ".join(testcase.additional_envs())
         containers = "sim client server " + " ".join(testcase.additional_containers())
         cmd = (
