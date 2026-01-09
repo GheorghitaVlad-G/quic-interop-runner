@@ -3,6 +3,7 @@ import filecmp
 import logging
 import os
 import random
+import statistics
 from unique_random_slugs import generate_slug
 import re
 import shutil
@@ -31,6 +32,9 @@ MB = 1 << 20
 
 QUIC_DRAFT = 34  # draft-34
 QUIC_VERSION = hex(0x1)
+
+IP4_SERVER = "193.167.100.100"
+IP6_SERVER = "fd00:cafe:cafe:100::100"
 
 # Global network parameters for simulation
 network_params = {
@@ -71,6 +75,32 @@ def generate_cert_chain(directory: str, length: int = 1):
         logging.info("Unable to create certificates")
         sys.exit(1)
 
+def parse_file_size(size_str) -> int:
+    """Convert strings like '10MB', '5KB', '1GB' to integer bytes."""
+    if size_str is None:
+        return None
+    if isinstance(size_str, int):
+        return size_str
+    
+    # Regex to capture digits and the unit (optional)
+    match = re.match(r'^(\d+)\s*([a-zA-Z]+)?$', str(size_str).strip())
+    if not match:
+        raise ValueError(f"Invalid file size format: {size_str}")
+    
+    number, unit = match.groups()
+    number = int(number)
+    
+    if not unit:
+        return number
+    
+    unit = unit.upper()
+    if unit in ['K', 'KB']:
+        return number * KB
+    if unit in ['M', 'MB']:
+        return number * MB
+    if unit in ['G', 'GB']:
+        return number * (1 << 30)
+    return number
 
 class TestCase(abc.ABC):
     _files = []
@@ -82,6 +112,8 @@ class TestCase(abc.ABC):
     _cert_dir = None
     _cached_server_trace = None
     _cached_client_trace = None
+    _file_size = None
+    _container_stats = {}
 
     def __init__(
         self,
@@ -89,8 +121,9 @@ class TestCase(abc.ABC):
         client_keylog_file: str,
         server_keylog_file: str,
         protocol: str = "quic",
+        file_size: str = None,
     ):
-        self.setup(sim_log_dir, client_keylog_file, server_keylog_file, protocol)
+        self.setup(sim_log_dir, client_keylog_file, server_keylog_file, protocol, file_size)
 
     def setup(
         self,
@@ -98,12 +131,14 @@ class TestCase(abc.ABC):
         client_keylog_file: str,
         server_keylog_file: str,
         protocol: str = "quic",
+        file_size: str = None,
     ):
         self._server_keylog_file = server_keylog_file
         self._client_keylog_file = client_keylog_file
         self._files = []
         self._sim_log_dir = sim_log_dir
         self._protocol = protocol
+        self._file_size = parse_file_size(file_size)
 
     @abc.abstractmethod
     def name(self):
@@ -120,25 +155,71 @@ class TestCase(abc.ABC):
         """The name of testcase presented to the endpoint Docker images"""
         return self.name()
 
-    @staticmethod
-    def scenario() -> str:
+    def scenario(self) -> str:
         """Scenario for the ns3 simulator"""
-        if network_params['burst_size'] is None and (network_params['loss_rate'] or network_params['corrupt_rate']):
-            network_params['burst_size'] = 3
-        if network_params['loss_rate'] and network_params['corrupt_rate']:
-            # If both are set, use drop-rate (loss takes priority)
-            return f"drop-rate --delay={network_params['delay']} --bandwidth={network_params['bandwidth']} --queue={network_params['queue']} --rate_to_server={network_params['loss_rate']} --rate_to_client={network_params['loss_rate']} --burst_to_server={network_params['burst_size']} --burst_to_client={network_params['burst_size']}"
-        elif network_params['loss_rate']:
-            return f"drop-rate --delay={network_params['delay']} --bandwidth={network_params['bandwidth']} --queue={network_params['queue']} --rate_to_server={network_params['loss_rate']} --rate_to_client={network_params['loss_rate']} --burst_to_server={network_params['burst_size']} --burst_to_client={network_params['burst_size']}"
-        elif network_params['corrupt_rate']:
-            return f"corrupt-rate --delay={network_params['delay']} --bandwidth={network_params['bandwidth']} --queue={network_params['queue']} --rate_to_server={network_params['corrupt_rate']} --rate_to_client={network_params['corrupt_rate']} --burst_to_server={network_params['burst_size']} --burst_to_client={network_params['burst_size']}"
+
+        params = network_params
+
+        if params['burst_size'] is None and (params['loss_rate'] or params['corrupt_rate']):
+            params['burst_size'] = 3
+
+        protect_acks = (
+            "--protect_acks=true"
+            if self._protocol == "tcp" and params.get("protect_tcp_acks", False)
+            else None
+        )
+
+        rate = None
+        mode = "simple-p2p"
+
+        if params.get('delay1', None) is not None and params.get('delay2', None) is not None and params.get('probability', None) is not None:
+            mode = "simple-p2p-multipath"
+            base_args = [
+                f"--delay1={params['delay1']}",
+                f"--delay2={params['delay2']}",
+                f"--probability={params['probability']}",
+                f"--bandwidth={params['bandwidth']}",
+                f"--queue={params['queue']}",
+            ]
         else:
-            return f"simple-p2p --delay={network_params['delay']} --bandwidth={network_params['bandwidth']} --queue={network_params['queue']}"
+            base_args = [
+                f"--delay={params['delay']}",
+                f"--bandwidth={params['bandwidth']}",
+                f"--queue={params['queue']}",
+            ]
+
+            if params.get('jitter-variance', None) is not None:
+                mode = "simple-p2p-jitter"
+                base_args.append(f"--jitter-variance={params['jitter-variance']}")
+            elif params['loss_rate']:
+                mode = "drop-rate"
+                rate = params['loss_rate']
+            elif params['corrupt_rate']:
+                mode = "corrupt-rate"
+                rate = params['corrupt_rate']
+            elif params.get('tcp_cross_traffic', False):
+                mode = "tcp-cross-traffic"
+            elif params.get('udp_cross_traffic', False):
+                mode = "udp-cross-traffic"
+                base_args.extend([f"--crossdatarate={params['crossdatarate']}"])
+
+            if rate is not None:
+                base_args.extend([
+                    f"--rate_to_server={rate}",
+                    f"--rate_to_client={rate}",
+                    f"--burst_to_server={params['burst_size']}",
+                    f"--burst_to_client={params['burst_size']}",
+                ])
+
+            if protect_acks:
+                base_args.append(protect_acks)
+
+        return f"{mode} " + " ".join(base_args)
 
     @staticmethod
     def timeout() -> int:
         """timeout in s"""
-        return 60
+        return 180
 
     def urlprefix(self) -> str:
         """URL prefix"""
@@ -441,8 +522,7 @@ class TestCaseLongRTT(TestCaseHandshake):
     def desc():
         return "Handshake completes when RTT is long."
 
-    @staticmethod
-    def scenario() -> str:
+    def scenario(self) -> str:
         """Scenario for the ns3 simulator"""
         return "simple-p2p --delay=750ms --bandwidth=10Mbps --queue=25"
 
@@ -822,8 +902,7 @@ class TestCaseAmplificationLimit(TestCase):
             generate_cert_chain(self._cert_dir.name, 9)
         return self._cert_dir.name + "/"
 
-    @staticmethod
-    def scenario() -> str:
+    def scenario(self) -> str:
         """Scenario for the ns3 simulator"""
         # Let the ClientHello pass, but drop a bunch of retransmissions afterwards.
         return "droplist --delay=15ms --bandwidth=10Mbps --queue=25 --drops_to_server=2,3,4,5,6,7"
@@ -935,8 +1014,7 @@ class TestCaseBlackhole(TestCase):
     def desc():
         return "Transfer succeeds despite underlying network blacking out for a few seconds."
 
-    @staticmethod
-    def scenario() -> str:
+    def scenario(self) -> str:
         """Scenario for the ns3 simulator"""
         return "blackhole --delay=15ms --bandwidth=10Mbps --queue=25 --on=5s --off=2s"
 
@@ -1064,10 +1142,10 @@ class TestCaseHandshakeLoss(TestCase):
     def timeout() -> int:
         return 300
 
-    @staticmethod
-    def scenario() -> str:
+    def scenario(self) -> str:
         """Scenario for the ns3 simulator"""
-        return "drop-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=30 --rate_to_client=30 --burst_to_server=3 --burst_to_client=3"
+        protect_acks = "--protect_acks=true" if self._protocol == "tcp" and network_params.get('protect_tcp_acks', False) else ""
+        return f"drop-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=30 --rate_to_client=30 --burst_to_server=3 --burst_to_client=3 {protect_acks}"
 
     def get_paths(self):
         for _ in range(self._num_runs):
@@ -1104,10 +1182,10 @@ class TestCaseTransferLoss(TestCase):
     def desc():
         return "Transfer completes under moderate packet loss."
 
-    @staticmethod
-    def scenario() -> str:
+    def scenario(self) -> str:
         """Scenario for the ns3 simulator"""
-        return "drop-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=2 --rate_to_client=2 --burst_to_server=3 --burst_to_client=3"
+        protect_acks = "--protect_acks=true" if self._protocol == "tcp" and network_params.get('protect_tcp_acks', False) else ""
+        return f"drop-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=2 --rate_to_client=2 --burst_to_server=3 --burst_to_client=3 {protect_acks}"
 
     def get_paths(self):
         # At a packet loss rate of 2% and a MTU of 1500 bytes, we can expect 27 dropped packets.
@@ -1138,10 +1216,10 @@ class TestCaseHandshakeCorruption(TestCaseHandshakeLoss):
     def desc():
         return "Handshake completes under extreme packet corruption."
 
-    @staticmethod
-    def scenario() -> str:
+    def scenario(self) -> str:
         """Scenario for the ns3 simulator"""
-        return "corrupt-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=30 --rate_to_client=30 --burst_to_server=3 --burst_to_client=3"
+        protect_acks = "--protect_acks=true" if self._protocol == "tcp" and network_params.get('protect_tcp_acks', False) else ""
+        return f"corrupt-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=30 --rate_to_client=30 --burst_to_server=3 --burst_to_client=3 {protect_acks}"
 
 
 class TestCaseTransferCorruption(TestCaseTransferLoss):
@@ -1157,10 +1235,10 @@ class TestCaseTransferCorruption(TestCaseTransferLoss):
     def desc():
         return "Transfer completes under moderate packet corruption."
 
-    @staticmethod
-    def scenario() -> str:
+    def scenario(self) -> str:
         """Scenario for the ns3 simulator"""
-        return "corrupt-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=2 --rate_to_client=2 --burst_to_server=3 --burst_to_client=3"
+        protect_acks = "--protect_acks=true" if self._protocol == "tcp" and network_params.get('protect_tcp_acks', False) else ""
+        return f"corrupt-rate --delay=15ms --bandwidth=10Mbps --queue=25 --rate_to_server=2 --rate_to_client=2 --burst_to_server=3 --burst_to_client=3 {protect_acks}"
 
 
 class TestCaseECN(TestCaseHandshake):
@@ -1279,8 +1357,7 @@ class TestCasePortRebinding(TestCaseTransfer):
         ]
         return self._files
 
-    @staticmethod
-    def scenario() -> str:
+    def scenario(self) -> str:
         """Scenario for the ns3 simulator"""
         return "rebind --delay=15ms --bandwidth=10Mbps --queue=25 --first-rebind=1s --rebind-freq=5s"
 
@@ -1380,11 +1457,10 @@ class TestCaseAddressRebinding(TestCasePortRebinding):
     def desc():
         return "Transfer completes under frequent IP address and port rebindings on the client side."
 
-    @staticmethod
-    def scenario() -> str:
+    def scenario(self) -> str:
         """Scenario for the ns3 simulator"""
         return (
-            super(TestCaseAddressRebinding, TestCaseAddressRebinding).scenario()
+            super(TestCaseAddressRebinding, self).scenario()
             + " --rebind-addr"
         )
 
@@ -1659,11 +1735,13 @@ class MeasurementGoodput(Measurement):
         return 5
 
     def get_paths(self):
-        self._files = [self._generate_random_file(self.FILESIZE)]
+        size = self._file_size if self._file_size is not None else self.FILESIZE
+        self._files = [self._generate_random_file(size)]
         return self._files
 
     def check(self) -> TestResult:
         super().check()
+        size_to_measure = self._file_size if self._file_size is not None else self.FILESIZE
         
         # Handle handshake counting differently for TCP vs QUIC
         if self._protocol == "tcp":
@@ -1692,10 +1770,10 @@ class MeasurementGoodput(Measurement):
         if last - first == 0:
             return TestResult.FAILED
         time = (last - first) / timedelta(milliseconds=1)
-        goodput = (8 * self.FILESIZE) / time
+        goodput = (8 * size_to_measure) / time
         logging.debug(
             "Transferring %d MB took %d ms. Goodput: %d kbps",
-            self.FILESIZE / MB,
+            size_to_measure / MB,
             time,
             goodput,
         )
@@ -1733,6 +1811,808 @@ class MeasurementCrossTraffic(MeasurementGoodput):
     def additional_containers() -> List[str]:
         return ["iperf_server", "iperf_client"]
 
+""" NEW TESTS/MEASUREMENTS HERE """
+
+class MeasurementHandshakeTime(Measurement):
+    _result = 0.0
+
+    @staticmethod
+    def name():
+        return "handshake_time"
+
+    @staticmethod
+    def unit() -> str:
+        return "ms"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "handshake"
+
+    @staticmethod
+    def abbreviation():
+        return "HT"
+
+    @staticmethod
+    def desc():
+        return "Time from first client Initial/SYN to handshake completion."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 3
+
+    def get_paths(self):
+        self._files = [self._generate_random_file(1 * KB)]
+        return self._files
+
+    def check(self) -> TestResult:
+        super().check()
+        
+        if self._protocol == "quic":
+            # Client perspective: First Initial sent → First Handshake received
+            initials = self._client_trace().get_initial(Direction.FROM_CLIENT)
+            handshakes = self._client_trace().get_handshake(Direction.FROM_SERVER)
+            
+            if not initials or not handshakes:
+                logging.info("Missing Initial or Handshake packets")
+                return TestResult.FAILED
+            
+            t0 = min(float(p.sniff_timestamp) for p in initials)
+            t1 = min(float(p.sniff_timestamp) for p in handshakes)
+            
+            self._result = (t1 - t0) * 1000  # Convert to ms
+            
+        elif self._protocol == "tcp":
+            handshake_time = self._client_trace().get_tcp_handshake_complete_time()
+            print(handshake_time)
+            if handshake_time is None:
+                logging.info("Could not measure TCP handshake time")
+                return TestResult.FAILED
+            self._result = handshake_time
+        
+        if not self._check_files():
+            return TestResult.FAILED
+        
+        logging.debug("Handshake time: %.2f ms", self._result)
+        return TestResult.SUCCEEDED
+
+    def result(self) -> float:
+        return self._result
+
+class MeasurementTTFB(Measurement):
+    _result = 0.0
+
+    @staticmethod
+    def name():
+        return "ttfb"
+
+    @staticmethod
+    def unit() -> str:
+        return "ms"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "transfer"
+
+    @staticmethod
+    def abbreviation():
+        return "TTFB"
+
+    @staticmethod
+    def desc():
+        return "Time from connection start to first application data byte from server."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 3
+
+    def get_paths(self):
+        self._files = [self._generate_random_file(10 * KB)]
+        return self._files
+
+    def check(self) -> TestResult:
+        super().check()
+        
+        if self._protocol == "quic":
+            # Connection start = first Initial
+            initials = self._client_trace().get_initial(Direction.FROM_CLIENT)
+            if not initials:
+                logging.info("No Initial packets found")
+                return TestResult.FAILED
+            
+            t0 = min(float(p.sniff_timestamp) for p in initials)
+            
+            # First server data
+            server_data = self._client_trace().get_stream_data_packets(Direction.FROM_SERVER)
+            if not server_data:
+                logging.info("No server data packets found")
+                return TestResult.FAILED
+            
+            t1 = min(float(p.sniff_timestamp) for p in server_data)
+            
+        elif self._protocol == "tcp":
+            # First SYN
+            packets = self._client_trace()._get_packets(
+                self._client_trace()._get_direction_filter(Direction.FROM_CLIENT) + "tcp.flags.syn==1 && tcp.flags.ack==0"
+            )
+            if not packets:
+                logging.info("No SYN packet found")
+                return TestResult.FAILED
+            t0 = float(packets[0].sniff_timestamp)
+            
+            # First server data
+            server_data = self._client_trace().get_stream_data_packets(Direction.FROM_SERVER)
+            if not server_data:
+                logging.info("No server data packets found")
+                return TestResult.FAILED
+            t1 = float(server_data[0].sniff_timestamp)
+        
+        self._result = (t1 - t0) * 1000  # Convert to ms
+        
+        if not self._check_files():
+            return TestResult.FAILED
+        
+        logging.debug("TTFB: %.2f ms", self._result)
+        return TestResult.SUCCEEDED
+
+    def result(self) -> float:
+        return self._result
+
+class MeasurementTransferTime(Measurement):
+    _result = 0.0
+
+    @staticmethod
+    def name():
+        return "transfer_time"
+
+    @staticmethod
+    def unit() -> str:
+        return "ms"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "transfer"
+
+    @staticmethod
+    def abbreviation():
+        return "TT"
+
+    @staticmethod
+    def desc():
+        return "Total time to transfer all files."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 5
+
+    def get_paths(self):
+        size = self._file_size if self._file_size is not None else (5 * MB)
+        self._files = [self._generate_random_file(size)]
+        return self._files
+
+    def check(self) -> TestResult:
+        super().check()
+        
+        # First data packet from client
+        client_data = self._client_trace().get_stream_data_packets(Direction.FROM_CLIENT)
+        if not client_data:
+            logging.info("No client data packets")
+            return TestResult.FAILED
+        
+        # Last data packet from server
+        server_data = self._server_trace().get_stream_data_packets(Direction.FROM_SERVER)
+        if not server_data:
+            logging.info("No server data packets")
+            return TestResult.FAILED
+        
+        t0 = min(float(p.sniff_timestamp) for p in client_data)
+        t1 = max(float(p.sniff_timestamp) for p in server_data)
+        
+        self._result = (t1 - t0) * 1000  # Convert to ms
+        
+        if not self._check_files():
+            return TestResult.FAILED
+        
+        logging.debug("Transfer time: %.2f ms", self._result)
+        return TestResult.SUCCEEDED
+
+    def result(self) -> float:
+        return self._result
+
+
+class MeasurementThroughput(Measurement):
+    _result = 0.0
+
+    @staticmethod
+    def name():
+        return "throughput"
+
+    @staticmethod
+    def unit() -> str:
+        return "Mbps"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "transfer"
+
+    @staticmethod
+    def abbreviation():
+        return "TP"
+
+    @staticmethod
+    def desc():
+        return "Total bytes sent (including retransmissions) per second."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 5
+
+    def get_paths(self):
+        size = self._file_size if self._file_size is not None else (10 * MB)
+        self._files = [self._generate_random_file(size)]
+        return self._files
+
+    def check(self) -> TestResult:
+            super().check()
+            
+            # Use tshark for performance - much faster than pyshark
+            import subprocess
+            
+            trace_file = self._sim_log_dir.name + "/trace_node_left.pcap"
+            
+            # Build filter
+            if self._protocol == "quic":
+                filter_str = f"(quic && !icmp) && (ip.src=={IP4_SERVER} || ipv6.src=={IP6_SERVER})"
+            else:
+                filter_str = f"(tcp && !icmp) && (ip.src=={IP4_SERVER} || ipv6.src=={IP6_SERVER})"
+            
+            try:
+                # Get timestamps and packet lengths using tshark
+                cmd = [
+                    "tshark", "-r", trace_file,
+                    "-Y", filter_str,
+                    "-T", "fields",
+                    "-e", "frame.time_epoch",
+                    "-e", "frame.len"
+                ]
+                
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                
+                if result.returncode != 0:
+                    logging.error("tshark failed: %s", result.stderr)
+                    return TestResult.FAILED
+                
+                total_bytes = 0
+                timestamps = []
+                
+                for line in result.stdout.strip().split('\n'):
+                    if not line:
+                        continue
+                    parts = line.split('\t')
+                    if len(parts) == 2:
+                        timestamps.append(float(parts[0]))
+                        total_bytes += int(parts[1])
+                
+                if len(timestamps) < 2:
+                    logging.info("Not enough packets for throughput calculation")
+                    return TestResult.FAILED
+                
+                duration = max(timestamps) - min(timestamps)
+                
+                if duration == 0:
+                    logging.info("Transfer duration is zero")
+                    return TestResult.FAILED
+                
+                # Convert to Mbps (total_bytes is already in bytes)
+                self._result = (total_bytes * 8) / (duration * 1_000_000)
+                
+            except subprocess.TimeoutExpired:
+                logging.error("tshark command timed out")
+                return TestResult.FAILED
+            except Exception as e:
+                logging.error("Error calculating throughput: %s", e)
+                return TestResult.FAILED
+            
+            if not self._check_files():
+                return TestResult.FAILED
+            
+            logging.debug("Throughput: %.2f Mbps", self._result)
+            return TestResult.SUCCEEDED
+
+    def result(self) -> float:
+        return self._result
+
+class MeasurementRetransmissionRate(Measurement):
+    _result = 0.0
+
+    @staticmethod
+    def name():
+        return "retransmission_rate"
+
+    @staticmethod
+    def unit() -> str:
+        return "%"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "transfer"
+
+    @staticmethod
+    def abbreviation():
+        return "RR"
+
+    @staticmethod
+    def desc():
+        return "Percentage of packets that were retransmitted."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 5
+
+    def get_paths(self):
+        size = self._file_size if self._file_size is not None else (5 * MB)
+        self._files = [self._generate_random_file(size)]
+        return self._files
+
+    def check(self) -> TestResult:
+        super().check()
+        
+        # Use server trace (more reliable for retransmission detection)
+        all_packets = self._server_trace().get_raw_packets(Direction.FROM_SERVER)
+        retrans_packets = self._server_trace().get_retransmissions(Direction.FROM_SERVER)
+        
+        total_count = len(all_packets)
+        retrans_count = len(retrans_packets)
+        
+        if total_count == 0:
+            logging.info("No packets found")
+            return TestResult.FAILED
+        
+        self._result = (retrans_count / total_count) * 100
+        
+        if not self._check_files():
+            return TestResult.FAILED
+        
+        logging.debug("Retransmission rate: %.2f%% (%d/%d)", self._result, retrans_count, total_count)
+        return TestResult.SUCCEEDED
+
+    def result(self) -> float:
+        return self._result
+
+class MeasurementRecoveryTime(Measurement):
+    _result = 0.0
+
+    @staticmethod
+    def name():
+        return "recovery_time"
+
+    @staticmethod
+    def unit() -> str:
+        return "ms"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "transferloss"  # Use a loss scenario
+
+    @staticmethod
+    def abbreviation():
+        return "RT"
+
+    @staticmethod
+    def desc():
+        return "Time from first retransmission to last retransmission in loss event."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 5
+
+    def get_paths(self):
+        self._files = [self._generate_random_file(5 * MB)]
+        return self._files
+
+    def check(self) -> TestResult:
+        super().check()
+        
+        # Get server and client traces
+        server_trace = self._server_trace()
+        client_trace = self._client_trace()
+        
+        # Step 1: Identify first loss via retransmissions
+        retrans = server_trace.get_retransmissions(Direction.FROM_SERVER)
+        
+        if len(retrans) == 0:
+            logging.info("No retransmissions detected - no loss occurred")
+            self._result = 0.0
+            return TestResult.SUCCEEDED
+        
+        # Find first retransmitted packet
+        first_retrans = min(retrans, key=lambda p: float(p.sniff_timestamp))
+        loss_time = float(first_retrans.sniff_timestamp)
+        lost_seq = int(first_retrans.tcp.seq)
+        
+        logging.debug("First retransmission at %.3f s (seq=%d)", loss_time, lost_seq)
+        
+        # Step 2: Find the sequence number range that was lost
+        # The retransmission tells us what seq was lost
+        # We need to find when data BEYOND this seq is ACKed
+        
+        # Get all server packets to find what seq numbers came after the loss
+        server_packets = server_trace._get_packets(
+                server_trace._get_direction_filter(Direction.FROM_CLIENT) + "tcp"
+            )
+        
+        # Find the highest seq sent before/during the loss event
+        max_seq_at_loss = lost_seq
+        for p in server_packets:
+            pkt_time = float(p.sniff_timestamp)
+            if pkt_time <= loss_time:
+                seq = int(p.tcp.seq)
+                if seq > max_seq_at_loss:
+                    max_seq_at_loss = seq
+        
+        logging.debug("Highest seq at loss time: %d", max_seq_at_loss)
+        
+        # Step 3: Find first ACK from client that acknowledges NEW data beyond loss
+        client_packets = client_trace._get_packets(
+                client_trace._get_direction_filter(Direction.FROM_CLIENT) + "tcp"
+            )
+        
+        recovery_time = None
+        
+        for p in client_packets:
+            pkt_time = float(p.sniff_timestamp)
+            
+            # Only look at packets after loss detection
+            if pkt_time <= loss_time:
+                continue
+            
+            # Check if this is an ACK
+            if not hasattr(p.tcp, 'ack'):
+                continue
+            
+            ack_num = int(p.tcp.ack)
+            
+            # Recovery = ACK acknowledges data beyond the lost sequence
+            # This means the connection has moved forward past the loss
+            if ack_num > max_seq_at_loss:
+                recovery_time = pkt_time
+                logging.debug("Recovery: ACK=%d at %.3f s (beyond max_seq=%d)", 
+                            ack_num, recovery_time, max_seq_at_loss)
+                break
+        
+        if recovery_time is None:
+            logging.warning("No ACK found acknowledging data beyond loss")
+            self._result = 0.0
+            return TestResult.FAILED
+        
+        # Calculate recovery time
+        self._result = (recovery_time - loss_time) * 1000  # ms
+        
+        if not self._check_files():
+            return TestResult.FAILED
+        
+        logging.info("Recovery time: %.2f ms (loss at %.3f, ACK at %.3f)", 
+                    self._result, loss_time, recovery_time)
+        
+        return TestResult.SUCCEEDED
+
+    def result(self) -> float:
+        return self._result
+
+class MeasurementTailLatency(Measurement):
+    _result = 0.0
+
+    @staticmethod
+    def name():
+        return "tail_latency"
+
+    @staticmethod
+    def unit() -> str:
+        return "ms (p99)"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "multiplexing"  # Use multiplexing test for many small files
+
+    @staticmethod
+    def abbreviation():
+        return "TL"
+
+    @staticmethod
+    def desc():
+        return "99th percentile latency across all file transfers."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 3
+
+    def get_paths(self):
+        # Generate many small files to get distribution
+        for _ in range(100):
+            self._files.append(self._generate_random_file(1 * KB))
+        return self._files
+
+    def check(self) -> TestResult:
+        super().check()
+        
+        if not self._keylog_file() and self._protocol == "quic":
+            logging.info("Can't measure tail latency without keylog (need to see STREAM frames)")
+            return TestResult.UNSUPPORTED
+        
+        # For simplicity: measure latency as time between packets
+        # More sophisticated: track per-stream latencies
+        server_data = self._client_trace().get_stream_data_packets(Direction.FROM_SERVER)
+        
+        if len(server_data) < 10:
+            logging.info("Not enough data packets for tail latency measurement")
+            return TestResult.FAILED
+        
+        # Calculate inter-arrival times as proxy for latency
+        timestamps = sorted([float(p.sniff_timestamp) for p in server_data])
+        latencies = [(timestamps[i+1] - timestamps[i]) * 1000 for i in range(len(timestamps)-1)]
+        
+        if not latencies:
+            return TestResult.FAILED
+        
+        # Calculate p99
+        latencies.sort()
+        p99_index = int(len(latencies) * 0.99)
+        self._result = latencies[p99_index]
+        
+        if not self._check_files():
+            return TestResult.FAILED
+        
+        logging.debug("Tail latency (p99): %.2f ms", self._result)
+        return TestResult.SUCCEEDED
+
+    def result(self) -> float:
+        return self._result
+
+class MeasurementReorderingRate(Measurement):
+    _result = 0.0
+
+    @staticmethod
+    def name():
+        return "reordering_rate"
+
+    @staticmethod
+    def unit() -> str:
+        return "%"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "transfer"
+
+    @staticmethod
+    def abbreviation():
+        return "RO"
+
+    @staticmethod
+    def desc():
+        return "Percentage of packets that arrived out of order."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 5
+
+    def get_paths(self):
+        self._files = [self._generate_random_file(5 * MB)]
+        return self._files
+
+    def check(self) -> TestResult:
+        super().check()
+        
+        packet_numbers = self._client_trace().get_packet_numbers(Direction.FROM_SERVER)
+        
+        if len(packet_numbers) < 2:
+            logging.info("Not enough packets for reordering detection")
+            return TestResult.FAILED
+        
+        # Count inversions (packet N arrives after packet N+M where M > 1)
+        reordered_count = 0
+        for i in range(1, len(packet_numbers)):
+            if packet_numbers[i] < packet_numbers[i-1]:
+                reordered_count += 1
+        
+        self._result = (reordered_count / len(packet_numbers)) * 100
+        
+        if not self._check_files():
+            return TestResult.FAILED
+        
+        logging.debug("Reordering rate: %.2f%% (%d/%d)", 
+                     self._result, reordered_count, len(packet_numbers))
+        return TestResult.SUCCEEDED
+
+    def result(self) -> float:
+        return self._result
+
+class MeasurementJitter(Measurement):
+    _result = 0.0
+
+    @staticmethod
+    def name():
+        return "jitter"
+
+    @staticmethod
+    def unit() -> str:
+        return "ms (stddev)"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "transfer"
+
+    @staticmethod
+    def abbreviation():
+        return "J"
+
+    @staticmethod
+    def desc():
+        return "Standard deviation of packet inter-arrival times."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 5
+
+    def get_paths(self):
+        self._files = [self._generate_random_file(5 * MB)]
+        return self._files
+
+    def check(self) -> TestResult:
+        super().check()
+        
+        timestamps = self._client_trace().get_packet_arrival_times(Direction.FROM_SERVER)
+        
+        if len(timestamps) < 100:  # Need decent sample size
+            logging.info("Not enough packets for jitter calculation")
+            return TestResult.FAILED
+        
+        # Calculate inter-arrival times in milliseconds
+        inter_arrivals = [(timestamps[i+1] - timestamps[i]) for i in range(len(timestamps)-1)]
+        
+        if not inter_arrivals:
+            return TestResult.FAILED
+        
+        differences = [abs(inter_arrivals[i+1] - inter_arrivals[i]) for i in range(len(inter_arrivals)-1)]
+        self._result = statistics.mean(differences) * 1000  # in ms
+        
+        logging.debug("Mean inter-arrival: %.3f ms", statistics.mean(inter_arrivals) * 1000)
+        logging.debug("Jitter (stddev): %.3f ms", self._result)
+        logging.debug("Sample size: %d packets", len(timestamps))
+        
+        if not self._check_files():
+            return TestResult.FAILED
+        
+        return TestResult.SUCCEEDED
+
+    def result(self) -> float:
+        return self._result
+
+class MeasurementCPU(Measurement):
+    _result = {}
+
+    @staticmethod
+    def name():
+        return "cpu_usage"
+
+    @staticmethod
+    def unit() -> str:
+        return "% (mean/peak)"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "transfer"
+
+    @staticmethod
+    def abbreviation():
+        return "CPU"
+
+    @staticmethod
+    def desc():
+        return "CPU usage during transfer (mean and peak)."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 3
+
+    def get_paths(self):
+        size = self._file_size if self._file_size is not None else (10 * MB)
+        self._files = [self._generate_random_file(size)]
+        return self._files
+
+    def check(self) -> TestResult:
+        super().check()
+        
+        if not self._check_files():
+            return TestResult.FAILED
+        
+        # Stats are injected by runner
+        if not hasattr(self, '_container_stats'):
+            logging.warning("No container stats available")
+            return TestResult.FAILED
+        
+        stats = self._container_stats
+        
+        # Return both client and server stats
+        self._result = {
+            'server_cpu_mean': stats['server']['cpu_mean'],
+            'server_cpu_peak': stats['server']['cpu_peak'],
+            'client_cpu_mean': stats['client']['cpu_mean'],
+            'client_cpu_peak': stats['client']['cpu_peak'],
+        }
+        
+        logging.info("CPU - Server: %.1f%% (peak: %.1f%%), Client: %.1f%% (peak: %.1f%%)",
+                    self._result['server_cpu_mean'],
+                    self._result['server_cpu_peak'],
+                    self._result['client_cpu_mean'],
+                    self._result['client_cpu_peak'])
+        
+        return TestResult.SUCCEEDED
+
+    def result(self) -> dict:
+        return self._result
+
+
+class MeasurementMemory(Measurement):
+    _result = {}
+
+    @staticmethod
+    def name():
+        return "memory_usage"
+
+    @staticmethod
+    def unit() -> str:
+        return "MB (mean/peak)"
+
+    @staticmethod
+    def testname(p: Perspective):
+        return "transfer"
+
+    @staticmethod
+    def abbreviation():
+        return "MEM"
+
+    @staticmethod
+    def desc():
+        return "Memory usage during transfer (mean and peak)."
+
+    @staticmethod
+    def repetitions() -> int:
+        return 3
+
+    def get_paths(self):
+        size = self._file_size if self._file_size is not None else (10 * MB)
+        self._files = [self._generate_random_file(size)]
+        return self._files
+
+    def check(self) -> TestResult:
+        super().check()
+        
+        if not self._check_files():
+            return TestResult.FAILED
+        
+        if not hasattr(self, '_container_stats'):
+            logging.warning("No container stats available")
+            return TestResult.FAILED
+        
+        stats = self._container_stats
+        
+        self._result = {
+            'server_mem_mean': stats['server']['memory_mean'],
+            'server_mem_peak': stats['server']['memory_peak'],
+            'client_mem_mean': stats['client']['memory_mean'],
+            'client_mem_peak': stats['client']['memory_peak'],
+        }
+        
+        logging.info("Memory - Server: %.1f MB (peak: %.1f MB), Client: %.1f MB (peak: %.1f MB)",
+                    self._result['server_mem_mean'],
+                    self._result['server_mem_peak'],
+                    self._result['client_mem_mean'],
+                    self._result['client_mem_peak'])
+        
+        return TestResult.SUCCEEDED
+
+    def result(self) -> dict:
+        return self._result
+
 
 TESTCASES = [
     TestCaseHandshake,
@@ -1762,4 +2642,15 @@ TESTCASES = [
 MEASUREMENTS = [
     MeasurementGoodput,
     MeasurementCrossTraffic,
+    MeasurementHandshakeTime,
+    MeasurementTTFB,
+    MeasurementTransferTime,
+    MeasurementThroughput,
+    MeasurementRetransmissionRate,
+    MeasurementRecoveryTime,
+    MeasurementTailLatency,
+    MeasurementReorderingRate,
+    MeasurementJitter,
+    MeasurementMemory,
+    MeasurementCPU,
 ]

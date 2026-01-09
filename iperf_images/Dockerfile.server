@@ -1,0 +1,12 @@
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y \
+    iperf3 \
+    net-tools \
+    iproute2 \
+    netcat-openbsd \
+    ethtool \
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /logs
+COPY server.sh /server.sh
+RUN chmod +x /server.sh
+CMD ["/server.sh"]

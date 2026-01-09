@@ -104,12 +104,19 @@ class TraceAnalyzer:
         override_prefs = {}
         if self._keylog_file is not None:
             override_prefs["tls.keylog_file"] = self._keylog_file
+
+        decode_as = {}
+        disable_protocol = None
+        if self._protocol == "quic":
+            decode_as = {"udp.port==443": "quic"}
+            disable_protocol = "http3"
+
         cap = pyshark.FileCapture(
             self._filename,
             display_filter=f,
             override_prefs=override_prefs,
-            disable_protocol="http3",
-            decode_as={"udp.port==443": "quic"},
+            disable_protocol=disable_protocol,
+            decode_as=decode_as if decode_as else None,
         )
         packets = []
         try:
@@ -263,3 +270,121 @@ class TraceAnalyzer:
     def get_0rtt(self) -> List:
         """Get all 0-RTT packets."""
         return self._get_long_header_packets(PacketType.ZERORTT, Direction.FROM_CLIENT)
+    
+    def get_tcp_handshake_complete_time(self) -> float:
+        """
+        For TCP: Get time from first SYN to final ACK of 3-way handshake.
+        Returns time in milliseconds, or None if handshake not found.
+        """
+        if self._protocol != "tcp":
+            return None
+        
+        try:
+            # Get SYN packet (client to server)
+            syn_packets = self._get_packets(
+                self._get_direction_filter(Direction.FROM_CLIENT) + 
+                "tcp.flags.syn==1 && tcp.flags.ack==0"
+            )
+            
+            # Get SYN-ACK packet (server to client)
+            synack_packets = self._get_packets(
+                self._get_direction_filter(Direction.FROM_SERVER) + 
+                "tcp.flags.syn==1 && tcp.flags.ack==1"
+            )
+            
+            # Get final ACK (client to server, after SYN-ACK)
+            ack_packets = self._get_packets(
+                self._get_direction_filter(Direction.FROM_CLIENT) + 
+                "tcp.flags.ack==1 && tcp.flags.syn==0 && tcp.len==0"
+            )
+            
+            if not syn_packets or not synack_packets:
+                logging.debug("Missing SYN or SYN-ACK packets")
+                return None
+            
+            syn_time = float(syn_packets[0].sniff_timestamp)
+            synack_time = float(synack_packets[0].sniff_timestamp)
+            
+            # Find the first ACK after SYN-ACK
+            final_ack_time = None
+            for p in ack_packets:
+                ack_time = float(p.sniff_timestamp)
+                if ack_time > synack_time:
+                    final_ack_time = ack_time
+                    break
+            
+            if final_ack_time is None:
+                # Fallback: just use SYN to SYN-ACK time
+                logging.debug("No final ACK found, using SYN to SYN-ACK")
+                return (synack_time - syn_time) * 1000
+            
+            return (final_ack_time - syn_time) * 1000
+            
+        except Exception as e:
+            logging.debug("Error calculating TCP handshake time: %s", e)
+            return None
+
+    def get_retransmissions(self, direction: Direction = Direction.ALL) -> List:
+        """
+        Get all retransmitted packets.
+        For QUIC: uses Wireshark's retransmission detection
+        For TCP: uses tcp.analysis.retransmission
+        """
+        packets = []
+        filter_str = self._get_direction_filter(direction)
+        
+        if self._protocol == "quic":
+            # QUIC retransmissions detected by Wireshark
+            filter_str += "(quic && (tcp.analysis.retransmission || tcp.analysis.fast_retransmission))"
+        else:
+            # TCP retransmissions
+            filter_str += "tcp.analysis.retransmission"
+        
+        for packet in self._get_packets(filter_str):
+            packets.append(packet)
+        
+        return packets
+
+    def get_packet_arrival_times(self, direction: Direction = Direction.ALL) -> List[float]:
+        """
+        Get timestamps of all packets in order of arrival.
+        Used for jitter and reordering analysis.
+        """
+        packets = self.get_raw_packets(direction)
+        return [float(p.sniff_timestamp) for p in packets]
+
+    def get_packet_numbers(self, direction: Direction = Direction.ALL) -> List[int]:
+        """
+        Get packet numbers (for QUIC) or sequence numbers (for TCP).
+        Used for reordering detection.
+        """
+        packets = self.get_raw_packets(direction)
+        numbers = []
+        
+        for p in packets:
+            if self._protocol == "quic":
+                if hasattr(p.quic, "packet_number"):
+                    numbers.append(int(p.quic.packet_number))
+            else:  # TCP
+                if hasattr(p.tcp, "seq"):
+                    numbers.append(int(p.tcp.seq))
+        
+        return numbers
+
+    def get_stream_data_packets(self, direction: Direction = Direction.ALL) -> List:
+        """
+        Get packets containing application data.
+        For QUIC: STREAM frames with data
+        For TCP: segments with payload
+        """
+        packets = []
+        
+        if self._protocol == "quic":
+            for p in self.get_1rtt(direction):
+                if hasattr(p, "stream_data_length") and int(p.stream_data_length) > 0:
+                    packets.append(p)
+        else:  # TCP
+            filter_str = self._get_direction_filter(direction) + "tcp.len > 0"
+            packets = self._get_packets(filter_str)
+        
+        return packets

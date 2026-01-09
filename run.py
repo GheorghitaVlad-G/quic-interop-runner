@@ -101,6 +101,12 @@ def main():
             default="15ms",
         )
         parser.add_argument(
+            "--jitter-variance",
+            help="variance for delay jitter (e.g., 1ms for normal distribution)",
+            type=str,
+            default=None,
+        )
+        parser.add_argument(
             "--bandwidth",
             help="network bandwidth (e.g., 10Mbps)",
             default="10Mbps",
@@ -128,6 +134,54 @@ def main():
             type=int,
             default=None,
         )
+        parser.add_argument(
+            "--protect-tcp-acks",
+            help="protect TCP ACK packets from drops in loss scenarios (only for TCP)",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--tcp-cross-traffic",
+            help="simulate TCP cross traffic",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--udp-cross-traffic",
+            help="simulate UDP cross traffic",
+            action="store_true",
+            default=False,
+        )
+        parser.add_argument(
+            "--crossdatarate",
+            help="data rate for cross traffic (e.g., 8Mbps)",
+            type=str,
+            default=None,
+        )
+        parser.add_argument(
+            "--delay1",
+            help="Fast path delay for multipath (e.g., 5ms)",
+            type=str,
+            default=None,
+        )
+        parser.add_argument(
+            "--delay2",
+            help="Slow path delay for multipath (e.g., 50ms)",
+            type=str,
+            default=None,
+        )
+        parser.add_argument(
+            "--probability",
+            help="Probability of choosing the slow path (0.0 to 1.0)",
+            type=str,
+            default=None,
+        )
+        parser.add_argument(
+            "--file-size",
+            help="File size for tests (e.g., 10MB, 5KB)",
+            type=str,
+            default=None,
+        )
         return parser.parse_args()
 
     args = get_args()
@@ -146,14 +200,23 @@ def main():
     import testcases
     testcases.network_params.update({
         'delay': args.delay,
+        'jitter-variance': args.jitter_variance,
         'bandwidth': args.bandwidth,
         'queue': args.queue,
         'loss_rate': args.loss_rate,
         'corrupt_rate': args.corrupt_rate,
         'burst_size': args.burst_size,
+        'protect_tcp_acks': args.protect_tcp_acks,
+        'tcp_cross_traffic': args.tcp_cross_traffic,
+        'udp_cross_traffic': args.udp_cross_traffic,
+        'crossdatarate': args.crossdatarate,
+        'delay1': args.delay1,
+        'delay2': args.delay2,
+        'probability': args.probability,
     })
 
     protocol = args.protocol
+    file_size = args.file_size
     client_implementations_filtered = [
         name
         for name in client_implementations
@@ -251,6 +314,7 @@ def main():
             )
         ),
         protocol=protocol,
+        file_size=file_size,
         scenario=args.scenario,
     ).run()
 

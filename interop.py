@@ -8,6 +8,8 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from datetime import datetime
 from typing import Callable, List, Tuple
 
@@ -22,6 +24,7 @@ from testcases import Perspective
 class MeasurementResult:
     result = TestResult
     details = str
+    raw_data = None
 
 
 class LogFileFormatter(logging.Formatter):
@@ -47,6 +50,7 @@ class InteropRunner:
     _no_auto_unsupported = []
     _protocol = "quic"
     _scenario = "simple"
+    _file_size = None
 
     def __init__(
         self,
@@ -62,6 +66,7 @@ class InteropRunner:
         no_auto_unsupported=[],
         protocol="quic",
         scenario="simple",
+        file_size=None,
     ):
         logger = logging.getLogger()
         logger.setLevel(logging.DEBUG)
@@ -82,6 +87,7 @@ class InteropRunner:
         self._save_files = save_files
         self._no_auto_unsupported = no_auto_unsupported
         self._protocol = protocol
+        self._file_size = file_size
         self._scenario = scenario
         if len(self._log_dir) == 0:
             self._log_dir = "logs_{:%Y-%m-%dT%H:%M:%S}".format(self._start_time)
@@ -97,6 +103,78 @@ class InteropRunner:
                 self.measurement_results.setdefault(server, {}).setdefault(
                     client, {}
                 ).setdefault(measurement, {})
+
+    def _sample_container_stats(self, container_name: str, stats_list: list, stop_event: threading.Event, interval: float = 0.5):
+        """Sample container CPU and memory stats in background."""
+        while not stop_event.is_set():
+            try:
+                # Get container ID
+                cmd = f"docker ps --format '{{{{.ID}}}} {{{{.Names}}}}' | awk '/^.* {container_name}$/ {{print $1}}'"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=1)
+                
+                if result.returncode != 0 or not result.stdout.strip():
+                    time.sleep(interval)
+                    continue
+                
+                container_id = result.stdout.strip()
+                
+                # Get stats with longer timeout
+                cmd = f"docker stats {container_id} --no-stream --format '{{{{.CPUPerc}}}},{{{{.MemUsage}}}}'"
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+                
+                if result.returncode == 0 and result.stdout.strip():
+                    stats_line = result.stdout.strip()
+                    parts = stats_line.split(',')
+                    if len(parts) == 2:
+                        cpu_str = parts[0].replace('%', '').strip()
+                        mem_str = parts[1].split('/')[0].strip()
+                        
+                        try:
+                            cpu_percent = float(cpu_str)
+                        except ValueError:
+                            cpu_percent = None
+                        
+                        mem_mb = None
+                        if 'MiB' in mem_str:
+                            mem_mb = float(mem_str.replace('MiB', ''))
+                        elif 'GiB' in mem_str:
+                            mem_mb = float(mem_str.replace('GiB', '')) * 1024
+                        elif 'KiB' in mem_str:
+                            mem_mb = float(mem_str.replace('KiB', '')) / 1024
+                        
+                        if cpu_percent is not None and mem_mb is not None:
+                            stats_list.append({
+                                'timestamp': time.time(),
+                                'cpu_percent': cpu_percent,
+                                'memory_mb': mem_mb
+                            })
+                
+            except subprocess.TimeoutExpired:
+                pass  # Silently skip timeout - container might be starting/stopping
+            except Exception as e:
+                logging.debug("Error sampling container stats: %s", e)
+            
+            time.sleep(interval)
+
+    def _aggregate_stats(self, stats_list: list) -> dict:
+        if not stats_list:
+            return {
+                'cpu_mean': None,
+                'cpu_peak': None,
+                'memory_mean': None,
+                'memory_peak': None
+            }
+        
+        cpu_values = [s['cpu_percent'] for s in stats_list]
+        mem_values = [s['memory_mb'] for s in stats_list]
+        
+        return {
+            'cpu_mean': statistics.mean(cpu_values),
+            'cpu_peak': max(cpu_values),
+            'memory_mean': statistics.mean(mem_values),
+            'memory_peak': max(mem_values),
+            'sample_count': len(stats_list)
+        }
 
     def _is_unsupported(self, lines: List[str]) -> bool:
         return any("exited with code 127" in str(line) for line in lines) or any(
@@ -332,14 +410,19 @@ class InteropRunner:
                     res = self.measurement_results[server][client][measurement]
                     if not hasattr(res, "result"):
                         continue
-                    measurements.append(
-                        {
-                            "name": measurement.name(),  # TODO: remove
-                            "abbr": measurement.abbreviation(),
-                            "result": res.result.value,
-                            "details": res.details,
-                        }
-                    )
+                    
+                    measurement_data = {
+                        "name": measurement.name(),
+                        "abbr": measurement.abbreviation(),
+                        "result": res.result.value,
+                        "details": res.details,
+                    }
+                    
+                    # Include raw structured data if available
+                    if hasattr(res, "raw_data") and res.raw_data is not None:
+                        measurement_data["data"] = res.raw_data
+                    
+                    measurements.append(measurement_data)
                 out["measurements"].append(measurements)
 
         f = open(self._output, "w")
@@ -377,7 +460,7 @@ class InteropRunner:
         client: str,
         log_dir_prefix: None,
         test: Callable[[], testcases.TestCase],
-    ) -> Tuple[TestResult, float]:
+    ) -> Tuple[TestResult, float, dict]:
         start_time = datetime.now()
         sim_log_dir = tempfile.TemporaryDirectory(dir="/tmp", prefix="logs_sim_")
         server_log_dir = tempfile.TemporaryDirectory(dir="/tmp", prefix="logs_server_")
@@ -395,7 +478,9 @@ class InteropRunner:
             client_keylog_file=client_log_dir.name + "/keys.log",
             server_keylog_file=server_log_dir.name + "/keys.log",
             protocol=self._protocol,
+            file_size=self._file_size,
         )
+
         print(
             "Server: "
             + server
@@ -433,21 +518,52 @@ class InteropRunner:
         )
         logging.debug("Command: %s", cmd)
 
+        server_stats = []
+        client_stats = []
+        stop_stats = threading.Event()
+        stats_threads_started = False
+
         status = TestResult.FAILED
         output = ""
         expired = False
+        
+        # Start docker compose in background
+        proc = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        
+        # Wait a bit for containers to start, then begin stats collection
+        time.sleep(2)  # Give containers time to start
+        
+        server_stats_thread = threading.Thread(
+            target=self._sample_container_stats,
+            args=("server", server_stats, stop_stats, 0.5),
+            daemon=True
+        )
+        client_stats_thread = threading.Thread(
+            target=self._sample_container_stats,
+            args=("client", client_stats, stop_stats, 0.5),
+            daemon=True
+        )
+        
+        server_stats_thread.start()
+        client_stats_thread.start()
+        stats_threads_started = True
+        
         try:
-            r = subprocess.run(
-                cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=testcase.timeout(),
-            )
-            output = r.stdout
-        except subprocess.TimeoutExpired as ex:
-            output = ex.stdout
+            output, _ = proc.communicate(timeout=testcase.timeout())
+        except subprocess.TimeoutExpired:
+            output, _ = proc.communicate()
             expired = True
+        finally:
+            # Stop stats collection
+            if stats_threads_started:
+                stop_stats.set()
+                server_stats_thread.join(timeout=2)
+                client_stats_thread.join(timeout=2)
 
         logging.debug("%s", output.decode("utf-8", errors="replace"))
 
@@ -467,12 +583,22 @@ class InteropRunner:
         self._copy_logs("client", client_log_dir)
         self._copy_logs("server", server_log_dir)
 
+        # Aggregate stats
+        container_stats = {
+            'server': self._aggregate_stats(server_stats),
+            'client': self._aggregate_stats(client_stats)
+        }
+        
+        logging.debug("Stats collected - Server: %d samples, Client: %d samples", 
+                    len(server_stats), len(client_stats))
+
         if not expired:
             lines = output.splitlines()
             if self._is_unsupported(lines):
                 status = TestResult.UNSUPPORTED
             elif any("client exited with code 0" in str(line) for line in lines):
                 try:
+                    testcase._container_stats = container_stats
                     status = testcase.check()
                 except FileNotFoundError as e:
                     logging.error(f"testcase.check() threw FileNotFoundError: {e}")
@@ -513,27 +639,94 @@ class InteropRunner:
         else:
             value = None
 
-        return status, value
+        return status, value, container_stats
 
     def _run_measurement(
         self, server: str, client: str, test: Callable[[], testcases.Measurement]
     ) -> MeasurementResult:
+        
+        if test.repetitions() > 1:
+            logging.debug("Running warmup iteration...")
+            warmup_result, _, warmup_stats = self._run_test(server, client, "warmup", test)
+            if warmup_result != TestResult.SUCCEEDED:
+                res = MeasurementResult()
+                res.result = warmup_result
+                res.details = ""
+                res.raw_data = None
+                return res
+
         values = []
+        all_stats = []
         for i in range(0, test.repetitions()):
-            result, value = self._run_test(server, client, "%d" % (i + 1), test)
+            result, value, container_stats = self._run_test(server, client, "%d" % (i + 1), test)
             if result != TestResult.SUCCEEDED:
                 res = MeasurementResult()
                 res.result = result
                 res.details = ""
+                res.raw_data = None
                 return res
+            
+            # Set container stats on the test instance for this run
+            test._container_stats = container_stats
+            all_stats.append(container_stats)
+
+
             values.append(value)
 
         logging.debug(values)
         res = MeasurementResult()
         res.result = TestResult.SUCCEEDED
-        res.details = "{:.0f} (± {:.0f}) {}".format(
-            statistics.mean(values), statistics.stdev(values), test.unit()
-        )
+        
+        # Handle comprehensive measurement (returns dict)
+        if values and isinstance(values[0], dict):
+            # Aggregate dict results across repetitions
+            all_keys = set()
+            for v in values:
+                all_keys.update(v.keys())
+            
+            aggregate = {}
+            for key in all_keys:
+                key_values = [v[key] for v in values if key in v]
+                if key_values:
+                    if len(key_values) > 1:
+                        aggregate[key] = {
+                            'mean': statistics.mean(key_values),
+                            'stdev': statistics.stdev(key_values),
+                        }
+                    else:
+                        aggregate[key] = {
+                            'mean': key_values[0],
+                            'stdev': 0,
+                        }
+            
+            # Store raw aggregated data
+            res.raw_data = aggregate
+            
+            # Format as readable string for display
+            details_parts = []
+            for key, stats in sorted(aggregate.items()):
+                if len(values) > 1:
+                    details_parts.append(f"{key}: {stats['mean']:.2f} (±{stats['stdev']:.2f})")
+                else:
+                    details_parts.append(f"{key}: {stats['mean']:.2f}")
+            res.details = "; ".join(details_parts)
+        else:
+            # Original float handling for individual measurements
+            res.raw_data = {
+                'mean': statistics.mean(values),
+                'stdev': statistics.stdev(values) if len(values) > 1 else 0,
+                'values': values,
+            }
+                
+            if len(values) > 1:
+                res.details = "{:.2f} (± {:.2f}) {}".format(  # Changed from {:.0f}
+                    statistics.mean(values), 
+                    statistics.stdev(values), 
+                    test.unit()
+                )
+            else:
+                res.details = "{:.2f} {}".format(values[0], test.unit())
+        
         return res
 
     def run(self):

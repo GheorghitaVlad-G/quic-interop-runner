@@ -11,6 +11,20 @@ if [ "$ROLE" == "client" ]; then
     
     # Wait for simulator to be ready (REQUIRED!)
     /wait-for-it.sh sim:57832 -s -t 30
+
+    for i in {1..50}; do
+        if curl -s --connect-timeout 1 http://193.167.100.100/ >/dev/null; then
+            echo "Server reachable through sim"
+            reachable=true
+            break
+        fi
+        sleep 0.1
+    done
+
+    if [ "$reachable" != "true" ]; then
+        echo "Server never became reachable through sim"
+        exit 1
+    fi
     
     echo "Simulator is ready!"
     
@@ -21,7 +35,7 @@ if [ "$ROLE" == "client" ]; then
         echo "Downloading $filename from $url"
         
         START=$(date +%s%N)
-        if curl -f -o "$filename" "$url" 2>&1 | tee -a /logs/client.log; then
+        if curl -f --retry 10 --retry-delay 1 --retry-connrefused --connect-timeout 1 -o "$filename" "$url"  >> /logs/client.log 2>&1; then
             END=$(date +%s%N)
             DURATION=$(( (END - START) / 1000000 ))
             echo "Downloaded $filename successfully in ${DURATION}ms"

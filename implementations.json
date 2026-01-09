@@ -1,6 +1,6 @@
 {
   "quic-go": {
-    "image": "custom-quic-network-simulator:latest",
+    "image": "martenseemann/quic-go-interop:latest",
     "url": "https://github.com/quic-go/quic-go",
     "role": "both",
     "protocol": "quic"
@@ -109,6 +109,18 @@
   },
   "tcp-client": {
     "image": "tcp-client:latest",
+    "url": "https://curl.se/",
+    "role": "client",
+    "protocol": "tcp"
+  },
+  "iperf-server": {
+    "image": "iperf-server:latest",
+    "url": "https://nginx.org/",
+    "role": "server",
+    "protocol": "tcp"
+  },
+  "iperf-client": {
+    "image": "iperf-client:latest",
     "url": "https://curl.se/",
     "role": "client",
     "protocol": "tcp"

@@ -1,7 +1,7 @@
 services:
   sim:
     image: custom-quic-network-simulator:latest
-    container_name: simcd 
+    container_name: sim
     hostname: sim
     stdin_open: true
     tty: true
