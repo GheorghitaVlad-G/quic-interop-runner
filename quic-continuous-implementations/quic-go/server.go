@@ -7,18 +7,19 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
-	"sync"
 
 	"github.com/quic-go/quic-go"
 )
 
-const bufferSize = 1024 * 1024 // 1MB buffer of 0xaa
+const (
+	bufferSize = 4 * 1024 * 1024 // 4MB buffer for writes
+)
 
 var dataBuffer []byte
 
 func init() {
-	// Pre-allocate buffer filled with 0xaa pattern
 	dataBuffer = make([]byte, bufferSize)
 	for i := range dataBuffer {
 		dataBuffer[i] = 0xaa
@@ -26,45 +27,34 @@ func init() {
 }
 
 func main() {
-	// Load TLS certificates
 	cert, err := tls.LoadX509KeyPair("/certs/cert.pem", "/certs/priv.key")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Setup QUIC config
+	// CRITICAL: Aggressive QUIC config for high throughput
 	quicConfig := &quic.Config{
-		// You are not multiplexing requests, you are shoveling bytes
 		MaxIncomingStreams:    1024,
 		MaxIncomingUniStreams: 0,
-
-		// Prevent the connection from idling out mid-test
-		MaxIdleTimeout:       0,
-		KeepAlivePeriod:      10 * time.Second,
-
-		// Let QUIC discover MTU, don’t cripple it
+		MaxIdleTimeout:        0,
+		KeepAlivePeriod:       10 * time.Second,
+		
+		// CRITICAL: Large flow control windows for high BDP
+		InitialStreamReceiveWindow:     10 * 1024 * 1024,  // 10MB per stream
+		MaxStreamReceiveWindow:         100 * 1024 * 1024, // 100MB max per stream
+		InitialConnectionReceiveWindow: 15 * 1024 * 1024,  // 15MB connection
+		MaxConnectionReceiveWindow:     100 * 1024 * 1024, // 100MB max connection
+		
 		DisablePathMTUDiscovery: false,
-
-		// Avoid tiny initial packets in the simulator
-
-		// You don’t need QUIC datagrams
-		EnableDatagrams:      false,
-
-		// Don’t artificially throttle CPU scheduling
-		HandshakeIdleTimeout: 30 * time.Second,
+		EnableDatagrams:         false,
+		HandshakeIdleTimeout:    30 * time.Second,
 	}
 
-	// Setup key logging if SSLKEYLOGFILE is set
 	var keyLog io.Writer
-	keyLogFile := os.Getenv("SSLKEYLOGFILE")
-	if keyLogFile != "" {
-		f, err := os.OpenFile(keyLogFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
-		if err != nil {
-			log.Printf("Warning: Failed to open keylog file: %v", err)
-		} else {
+	if keyLogFile := os.Getenv("SSLKEYLOGFILE"); keyLogFile != "" {
+		if f, err := os.OpenFile(keyLogFile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600); err == nil {
 			keyLog = f
 			defer f.Close()
-			log.Printf("TLS keys will be logged to %s", keyLogFile)
 		}
 	}
 
@@ -74,19 +64,16 @@ func main() {
 		KeyLogWriter: keyLog,
 	}
 
-	// Get duration from environment (default to 10 seconds if not set)
 	durationStr := os.Getenv("TRANSFER_DURATION")
 	duration := 10 * time.Second
 	if durationStr != "" {
-		seconds, err := strconv.Atoi(durationStr)
-		if err == nil && seconds > 0 {
+		if seconds, err := strconv.Atoi(durationStr); err == nil && seconds > 0 {
 			duration = time.Duration(seconds) * time.Second
 		}
 	}
 
-	log.Printf("Starting QUIC streaming server on :443, duration: %v", duration)
+	log.Printf("Starting optimized QUIC server on :443, duration: %v", duration)
 
-	// Setup QUIC listener
 	listener, err := quic.ListenAddr(":443", tlsConfig, quicConfig)
 	if err != nil {
 		log.Fatal(err)
@@ -105,41 +92,73 @@ func main() {
 }
 
 func handleConnection(conn quic.Connection, duration time.Duration) {
-    defer conn.CloseWithError(0, "done")
-    log.Printf("New connection from %s", conn.RemoteAddr())
+	defer conn.CloseWithError(0, "done")
+	log.Printf("New connection from %s", conn.RemoteAddr())
 
-    startTime := time.Now()
-    totalBytes := int64(0)
-    var totalBytesMutex sync.Mutex
+	var totalBytes atomic.Int64
+	startTime := time.Now()
+	
+	// Global timer channel
+	done := make(chan struct{})
+	go func() {
+		time.Sleep(duration)
+		close(done)
+	}()
 
-    // Accept streams until the connection closes
-    for {
-        stream, err := conn.AcceptStream(context.Background())
-        if err != nil {
-            log.Printf("AcceptStream error: %v", err)
-            break
-        }
+	// Accept streams and spawn writers
+	go func() {
+		for {
+			stream, err := conn.AcceptStream(context.Background())
+			if err != nil {
+				return
+			}
 
-        go func(s quic.Stream) {
-            defer s.Close()
-            for time.Since(startTime) < duration {
-                n, err := s.Write(dataBuffer)
-                if err != nil {
-                    break
-                }
-                totalBytesMutex.Lock()
-                totalBytes += int64(n)
-                totalBytesMutex.Unlock()
-            }
-        }(stream)
-    }
+			go func(s quic.Stream) {
+				defer s.Close()
+				
+				// Wait for client ready signal
+				readBuf := make([]byte, 1)
+				s.Read(readBuf)
+				
+				localBytes := int64(0)
+				
+				// Tight write loop - check timer less frequently
+				writeCount := 0
+				for {
+					select {
+					case <-done:
+						totalBytes.Add(localBytes)
+						return
+					default:
+						n, err := s.Write(dataBuffer)
+						if err != nil {
+							totalBytes.Add(localBytes)
+							return
+						}
+						localBytes += int64(n)
+						writeCount++
+						
+						// Only check time every 100 writes (400MB) to reduce overhead
+						if writeCount%100 == 0 {
+							if time.Since(startTime) >= duration {
+								totalBytes.Add(localBytes)
+								return
+							}
+						}
+					}
+				}
+			}(stream)
+		}
+	}()
 
-    // Wait until duration is done
-    for time.Since(startTime) < duration {
-        time.Sleep(100 * time.Millisecond)
-    }
+	// Wait for duration
+	<-done
+	time.Sleep(200 * time.Millisecond) // Grace period
 
-    elapsed := time.Since(startTime)
-    log.Printf("Transfer complete: %d bytes in %v (%.2f Mbps)",
-        totalBytes, elapsed, float64(totalBytes*8)/(elapsed.Seconds()*1e6))
+	elapsed := time.Since(startTime)
+	finalBytes := totalBytes.Load()
+	throughputMbps := float64(finalBytes*8) / (elapsed.Seconds() * 1e6)
+
+	log.Printf("Transfer complete: %d bytes in %v (%.2f Mbps)",
+		finalBytes, elapsed, throughputMbps)
 }
