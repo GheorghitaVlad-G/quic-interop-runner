@@ -1,15 +1,15 @@
 FROM martenseemann/quic-network-simulator-endpoint:latest
 
-# Install nginx and Python3 (Debian-based)
-RUN apt-get update && \
-    apt-get install -y nginx python3 && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y wget iperf3 && \
+    wget https://go.dev/dl/go1.21.5.linux-amd64.tar.gz && \
+    tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz
 
-# Copy configuration and scripts
-COPY nginx.conf /etc/nginx/nginx.conf
-COPY streaming_server.py /streaming_server.py
+ENV PATH="${PATH}:/usr/local/go/bin"
+
+WORKDIR /app
+COPY server.go .
+RUN go mod init streaming && go build -o streaming-server server.go
+
 COPY run_endpoint.sh /run_endpoint.sh
-RUN chmod +x /run_endpoint.sh /streaming_server.py
-
+RUN chmod +x /run_endpoint.sh
 ENTRYPOINT ["/run_endpoint.sh"]
