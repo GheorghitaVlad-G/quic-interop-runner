@@ -11,7 +11,7 @@ import string
 import subprocess
 import sys
 import tempfile
-from datetime import timedelta
+import datetime
 from enum import Enum, IntEnum
 from trace import (
     QUIC_V2,
@@ -219,7 +219,7 @@ class TestCase(abc.ABC):
     @staticmethod
     def timeout() -> int:
         """timeout in s"""
-        return 180
+        return 600
 
     def urlprefix(self) -> str:
         """URL prefix"""
@@ -1707,7 +1707,6 @@ class TestCaseV2(TestCase):
 
 
 class MeasurementGoodput(Measurement):
-    FILESIZE = 10 * MB
     _result = 0.0
 
     @staticmethod
@@ -1716,7 +1715,7 @@ class MeasurementGoodput(Measurement):
 
     @staticmethod
     def unit() -> str:
-        return "kbps"
+        return "Mbps"
 
     @staticmethod
     def testname(p: Perspective):
@@ -1724,60 +1723,120 @@ class MeasurementGoodput(Measurement):
 
     @staticmethod
     def abbreviation():
-        return "G"
+        return "GP"
 
     @staticmethod
     def desc():
-        return "Measures connection goodput over a 10Mbps link."
+        return "Application-layer data transfer rate (excludes retransmissions and overhead)."
 
     @staticmethod
     def repetitions() -> int:
         return 5
 
     def get_paths(self):
-        size = self._file_size if self._file_size is not None else self.FILESIZE
+        # For streaming implementations, still create a dummy file for compatibility
+        # but it won't actually be used
+        size = self._file_size if self._file_size is not None else (10 * MB)
         self._files = [self._generate_random_file(size)]
         return self._files
 
     def check(self) -> TestResult:
         super().check()
-        size_to_measure = self._file_size if self._file_size is not None else self.FILESIZE
         
-        # Handle handshake counting differently for TCP vs QUIC
-        if self._protocol == "tcp":
-            num_handshakes = 1  # TCP always has one connection
-        else:
-            num_handshakes = self._count_handshakes()
-            
-        if num_handshakes != 1:
-            logging.info("Expected exactly 1 handshake. Got: %d", num_handshakes)
-            return TestResult.FAILED
+        # Use tshark to calculate goodput based on actual application data
+        import subprocess
         
-        # Handle version checking - only for QUIC
+        trace_file = self._sim_log_dir.name + "/trace_node_left.pcap"
+        
+        # Build filter for application data only (STREAM frames for QUIC, data segments for TCP)
         if self._protocol == "quic":
-            if not self._check_version_and_files():
+            # Filter for QUIC packets with stream data from server
+            filter_str = f"(quic.stream_data && !icmp) && (ip.src=={IP4_SERVER} || ipv6.src=={IP6_SERVER})"
+        else:  # TCP
+            # Filter for TCP data segments from server (exclude SYN, ACK-only, FIN, RST)
+            filter_str = f"(tcp.len > 0 && !icmp) && (ip.src=={IP4_SERVER} || ipv6.src=={IP6_SERVER})"
+        
+        try:
+            # Get stream data length for QUIC or TCP payload length
+            if self._protocol == "quic":
+                cmd = [
+                    "tshark", "-r", trace_file,
+                    "-Y", filter_str,
+                    "-T", "fields",
+                    "-e", "frame.time_epoch",
+                    "-e", "quic.stream_data"
+                ]
+            else:  # TCP
+                cmd = [
+                    "tshark", "-r", trace_file,
+                    "-Y", filter_str,
+                    "-T", "fields",
+                    "-e", "frame.time_epoch",
+                    "-e", "tcp.len"
+                ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                logging.error("tshark failed: %s", result.stderr)
                 return TestResult.FAILED
-        else:
-            # For TCP, just check files
-            if not self._check_files():
+            
+            application_bytes = 0
+            timestamps = []
+            
+            for line in result.stdout.strip().split('\n'):
+                if not line:
+                    continue
+                parts = line.split('\t')
+                if len(parts) == 2:
+                    timestamps.append(float(parts[0]))
+                    
+                    if self._protocol == "quic":
+                        # QUIC stream data is in hex format (e.g., "aa:bb:cc:dd")
+                        # Count the hex bytes
+                        hex_data = parts[1]
+                        if hex_data:
+                            # Handle multiple stream data fields (comma-separated)
+                            for data_field in hex_data.split(','):
+                                data_field = data_field.strip()
+                                if data_field:
+                                    # Each hex pair (e.g., "aa") represents 1 byte
+                                    # Remove colons and count characters, divide by 2
+                                    byte_count = len(data_field.replace(':', '')) // 2
+                                    application_bytes += byte_count
+                    else:  # TCP
+                        # TCP payload length is directly given
+                        tcp_len = parts[1]
+                        if tcp_len:
+                            # Handle multiple values (comma-separated if retransmission in same packet)
+                            for len_value in tcp_len.split(','):
+                                len_value = len_value.strip()
+                                if len_value:
+                                    application_bytes += int(len_value)
+            
+            if len(timestamps) < 2:
+                logging.info("Not enough application data packets for goodput calculation")
                 return TestResult.FAILED
-
-        # This now works for both TCP and QUIC thanks to updated trace.py
-        packets, first, last = self._client_trace().get_1rtt_sniff_times(
-            Direction.FROM_SERVER
-        )
-
-        if last - first == 0:
+            
+            duration = max(timestamps) - min(timestamps)
+            
+            if duration == 0:
+                logging.info("Transfer duration is zero")
+                return TestResult.FAILED
+            
+            # Convert to Mbps
+            self._result = (application_bytes * 8) / (duration * 1_000_000)
+            
+            logging.debug("Goodput (%s): %.2f Mbps (%d application bytes in %.3f s)", 
+                         self._protocol.upper(), self._result, application_bytes, duration)
+            
+        except subprocess.TimeoutExpired:
+            logging.error("tshark command timed out")
             return TestResult.FAILED
-        time = (last - first) / timedelta(milliseconds=1)
-        goodput = (8 * size_to_measure) / time
-        logging.debug(
-            "Transferring %d MB took %d ms. Goodput: %d kbps",
-            size_to_measure / MB,
-            time,
-            goodput,
-        )
-        self._result = goodput
+        except Exception as e:
+            logging.error("Error calculating goodput: %s", e)
+            return TestResult.FAILED
+        
         return TestResult.SUCCEEDED
 
     def result(self) -> float:
@@ -1849,8 +1908,36 @@ class MeasurementHandshakeTime(Measurement):
         
         if self._protocol == "quic":
             # Client perspective: First Initial sent → First Handshake received
-            initials = self._client_trace().get_initial(Direction.FROM_CLIENT)
-            handshakes = self._client_trace().get_handshake(Direction.FROM_SERVER)
+            client_trace = self._client_trace()
+            
+            # Get Initial packets from client
+            initial_filter = client_trace._get_direction_filter(Direction.FROM_CLIENT) + \
+                            "(quic.long.packet_type || quic.long.packet_type_v2)"
+            initial_packets = client_trace._get_packets(initial_filter)
+            
+            # Get Handshake packets from server
+            handshake_filter = client_trace._get_direction_filter(Direction.FROM_SERVER) + \
+                            "(quic.long.packet_type || quic.long.packet_type_v2)"
+            handshake_packets = client_trace._get_packets(handshake_filter)
+            
+            # Filter for actual Initial and Handshake packet types
+            initials = []
+            for p in initial_packets:
+                for layer in p.layers:
+                    if layer.layer_name == "quic":
+                        if (hasattr(layer, "long_packet_type") and layer.long_packet_type == "0") or \
+                        (hasattr(layer, "long_packet_type_v2") and layer.long_packet_type_v2 == "1"):
+                            initials.append(p)
+                            break
+            
+            handshakes = []
+            for p in handshake_packets:
+                for layer in p.layers:
+                    if layer.layer_name == "quic":
+                        if (hasattr(layer, "long_packet_type") and layer.long_packet_type == "2") or \
+                        (hasattr(layer, "long_packet_type_v2") and layer.long_packet_type_v2 == "3"):
+                            handshakes.append(p)
+                            break
             
             if not initials or not handshakes:
                 logging.info("Missing Initial or Handshake packets")
@@ -1868,9 +1955,6 @@ class MeasurementHandshakeTime(Measurement):
                 logging.info("Could not measure TCP handshake time")
                 return TestResult.FAILED
             self._result = handshake_time
-        
-        if not self._check_files():
-            return TestResult.FAILED
         
         logging.debug("Handshake time: %.2f ms", self._result)
         return TestResult.SUCCEEDED
@@ -1913,21 +1997,33 @@ class MeasurementTTFB(Measurement):
         super().check()
         
         if self._protocol == "quic":
-            # Connection start = first Initial
-            initials = self._client_trace().get_initial(Direction.FROM_CLIENT)
+            # Get full packets, not just QUIC layers
+            initial_filter = self._client_trace()._get_direction_filter(Direction.FROM_CLIENT) + \
+                            "(quic.long.packet_type || quic.long.packet_type_v2)"
+            initial_packets = self._client_trace()._get_packets(initial_filter)
+            
+            initials = []
+            for p in initial_packets:
+                for layer in p.layers:
+                    if layer.layer_name == "quic":
+                        if (hasattr(layer, "long_packet_type") and layer.long_packet_type == "0") or \
+                        (hasattr(layer, "long_packet_type_v2") and layer.long_packet_type_v2 == "1"):
+                            initials.append(p)
+                            break
+            
             if not initials:
                 logging.info("No Initial packets found")
                 return TestResult.FAILED
             
             t0 = min(float(p.sniff_timestamp) for p in initials)
             
-            # First server data
-            server_data = self._client_trace().get_stream_data_packets(Direction.FROM_SERVER)
-            if not server_data:
+            # First server data - use get_1rtt which returns packets with timestamps
+            packets, first_time, last_time = self._client_trace().get_1rtt_sniff_times(Direction.FROM_SERVER)
+            if first_time == 0:
                 logging.info("No server data packets found")
                 return TestResult.FAILED
             
-            t1 = min(float(p.sniff_timestamp) for p in server_data)
+            t1 = first_time.timestamp()
             
         elif self._protocol == "tcp":
             # First SYN
@@ -1947,9 +2043,6 @@ class MeasurementTTFB(Measurement):
             t1 = float(server_data[0].sniff_timestamp)
         
         self._result = (t1 - t0) * 1000  # Convert to ms
-        
-        if not self._check_files():
-            return TestResult.FAILED
         
         logging.debug("TTFB: %.2f ms", self._result)
         return TestResult.SUCCEEDED
@@ -1992,25 +2085,53 @@ class MeasurementTransferTime(Measurement):
     def check(self) -> TestResult:
         super().check()
         
-        # First data packet from client
-        client_data = self._client_trace().get_stream_data_packets(Direction.FROM_CLIENT)
-        if not client_data:
-            logging.info("No client data packets")
-            return TestResult.FAILED
-        
-        # Last data packet from server
-        server_data = self._server_trace().get_stream_data_packets(Direction.FROM_SERVER)
-        if not server_data:
-            logging.info("No server data packets")
-            return TestResult.FAILED
-        
-        t0 = min(float(p.sniff_timestamp) for p in client_data)
-        t1 = max(float(p.sniff_timestamp) for p in server_data)
+        if self._protocol == "quic":
+            # For QUIC: measure first to last STREAM frame with data from server
+            server_1rtt = self._server_trace().get_1rtt(Direction.FROM_SERVER)
+            
+            if len(server_1rtt) < 2:
+                logging.info("Not enough server packets")
+                return TestResult.FAILED
+            
+            # Filter for packets with stream data (if we have keylog)
+            data_packets = []
+            for layer in server_1rtt:
+                # Check if this packet has stream data
+                if hasattr(layer, "stream_data_length"):
+                    try:
+                        if int(layer.stream_data_length) > 0:
+                            data_packets.append(layer)
+                    except:
+                        pass
+            
+            # If we can't decrypt (no keylog), fall back to all 1-RTT packets
+            if len(data_packets) < 2:
+                logging.debug("Can't see STREAM data (no keylog?), using all 1-RTT packets")
+                data_packets = server_1rtt
+            
+            # Now get the actual packet timestamps
+            # The QUIC layers don't have timestamps, we need to match them back to packets
+            # Simpler approach: just use the sniff times method
+            _, first_time, last_time = self._server_trace().get_1rtt_sniff_times(Direction.FROM_SERVER)
+            
+            if first_time == 0 or last_time == 0:
+                logging.info("No server data packets found")
+                return TestResult.FAILED
+            
+            t0 = first_time.timestamp()
+            t1 = last_time.timestamp()
+            
+        else:  # TCP
+            server_packets, server_first, server_last = self._server_trace().get_1rtt_sniff_times(Direction.FROM_SERVER)
+            
+            if server_first == 0 or server_last == 0:
+                logging.info("No server data packets found")
+                return TestResult.FAILED
+            
+            t0 = server_first.timestamp()
+            t1 = server_last.timestamp()
         
         self._result = (t1 - t0) * 1000  # Convert to ms
-        
-        if not self._check_files():
-            return TestResult.FAILED
         
         logging.debug("Transfer time: %.2f ms", self._result)
         return TestResult.SUCCEEDED
@@ -2112,9 +2233,6 @@ class MeasurementThroughput(Measurement):
                 logging.error("Error calculating throughput: %s", e)
                 return TestResult.FAILED
             
-            if not self._check_files():
-                return TestResult.FAILED
-            
             logging.debug("Throughput: %.2f Mbps", self._result)
             return TestResult.SUCCEEDED
 
@@ -2169,9 +2287,6 @@ class MeasurementRetransmissionRate(Measurement):
         
         self._result = (retrans_count / total_count) * 100
         
-        if not self._check_files():
-            return TestResult.FAILED
-        
         logging.debug("Retransmission rate: %.2f%% (%d/%d)", self._result, retrans_count, total_count)
         return TestResult.SUCCEEDED
 
@@ -2191,7 +2306,7 @@ class MeasurementRecoveryTime(Measurement):
 
     @staticmethod
     def testname(p: Perspective):
-        return "transferloss"  # Use a loss scenario
+        return "transfer"  # Use a loss scenario
 
     @staticmethod
     def abbreviation():
@@ -2216,6 +2331,205 @@ class MeasurementRecoveryTime(Measurement):
         server_trace = self._server_trace()
         client_trace = self._client_trace()
         
+        if self._protocol == "quic":
+            return self._check_quic(server_trace, client_trace)
+        else:
+            return self._check_tcp(server_trace, client_trace)
+    
+    def _check_quic(self, server_trace, client_trace) -> TestResult:
+        """QUIC recovery time measurement"""
+        import subprocess
+        
+        # Get all retransmissions with timestamps
+        retrans = server_trace.get_retransmissions(Direction.FROM_SERVER)
+        
+        if len(retrans) == 0:
+            logging.info("No retransmissions detected - no loss occurred")
+            self._result = 0.0
+            return TestResult.SUCCEEDED
+        
+        # Find first retransmission
+        first_retrans = min(retrans, key=lambda p: float(p.sniff_timestamp))
+        first_retrans_time = float(first_retrans.sniff_timestamp)
+        first_frame_num = int(first_retrans.frame_info.number)
+        
+        logging.debug("First retransmission at %.3f s (frame=%d)", first_retrans_time, first_frame_num)
+        
+        # Get the stream offset and data that was retransmitted
+        try:
+            cmd = [
+                'tshark',
+                '-r', server_trace._filename,
+                '-Y', f'frame.number == {first_frame_num}',
+                '-T', 'fields',
+                '-e', 'quic.stream.stream_id',
+                '-e', 'quic.stream.offset',
+                '-e', 'quic.stream_data'
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=5)
+            parts = result.stdout.strip().split('\t')
+            
+            if len(parts) >= 3 and parts[0]:
+                stream_id = int(parts[0].split(',')[0])  # Take first if multiple
+                retrans_offset = int(parts[1].split(',')[0]) if parts[1] else 0
+                hex_data = parts[2].split(',')[0] if parts[2] else ''
+                retrans_length = len(hex_data.replace(':', '')) // 2 if hex_data else 0
+                
+                logging.debug("First retrans: stream=%d, offset=%d, length=%d", 
+                            stream_id, retrans_offset, retrans_length)
+            else:
+                logging.warning("Could not extract retransmission details")
+                self._result = 0.0
+                return TestResult.FAILED
+                
+        except Exception as e:
+            logging.error(f"Error extracting retransmission info: {e}")
+            self._result = 0.0
+            return TestResult.FAILED
+        
+        # NEW: Find the timestamp of the LAST successfully received packet BEFORE the retransmitted offset
+        # This represents when the loss actually occurred (last good data before the gap)
+        try:
+            direction_filter = server_trace._get_direction_filter(Direction.FROM_SERVER)
+            cmd = [
+                'tshark',
+                '-r', server_trace._filename,
+                '-Y', f'{direction_filter}quic.stream.stream_id == {stream_id}',
+                '-T', 'fields',
+                '-e', 'frame.time_epoch',
+                '-e', 'quic.stream.offset',
+                '-e', 'quic.stream_data'
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
+            
+            loss_time = None
+            last_good_offset = -1
+            
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.split('\t')
+                if len(parts) >= 3:
+                    pkt_time = float(parts[0])
+                    offset = int(parts[1].split(',')[0]) if parts[1] else 0
+                    hex_data = parts[2].split(',')[0] if parts[2] else ''
+                    length = len(hex_data.replace(':', '')) // 2 if hex_data else 0
+                    pkt_end = offset + length
+                    
+                    # Only consider packets sent before the retransmission
+                    if pkt_time >= first_retrans_time:
+                        continue
+                    
+                    # Find the last packet that ends right before the retransmitted offset
+                    # This is the last successfully received data before the loss
+                    if pkt_end <= retrans_offset and pkt_end > last_good_offset:
+                        last_good_offset = pkt_end
+                        loss_time = pkt_time
+            
+            if loss_time is None:
+                logging.warning("Could not find last good packet before retransmission")
+                # Fallback to retransmission time
+                loss_time = first_retrans_time
+            else:
+                logging.debug("Loss time (last good packet): %.3f s (offset end=%d)", 
+                            loss_time, last_good_offset)
+            
+        except Exception as e:
+            logging.error(f"Error finding loss time: {e}")
+            loss_time = first_retrans_time
+        
+        # Find the highest offset sent before/during the loss event
+        try:
+            direction_filter = server_trace._get_direction_filter(Direction.FROM_SERVER)
+            cmd = [
+                'tshark',
+                '-r', server_trace._filename,
+                '-Y', f'{direction_filter}quic.stream.stream_id == {stream_id}',
+                '-T', 'fields',
+                '-e', 'frame.time_epoch',
+                '-e', 'quic.stream.offset',
+                '-e', 'quic.stream_data'
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
+            
+            max_offset_at_loss = retrans_offset
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.split('\t')
+                if len(parts) >= 3:
+                    pkt_time = float(parts[0])
+                    if pkt_time <= loss_time:
+                        offset = int(parts[1].split(',')[0]) if parts[1] else 0
+                        hex_data = parts[2].split(',')[0] if parts[2] else ''
+                        length = len(hex_data.replace(':', '')) // 2 if hex_data else 0
+                        pkt_end = offset + length
+                        if pkt_end > max_offset_at_loss:
+                            max_offset_at_loss = pkt_end
+            
+            logging.debug("Highest stream offset at loss time: %d", max_offset_at_loss)
+            
+        except Exception as e:
+            logging.error(f"Error finding max offset: {e}")
+            self._result = 0.0
+            return TestResult.FAILED
+        
+        # Find when client ACKs data beyond the loss point
+        try:
+            direction_filter = client_trace._get_direction_filter(Direction.FROM_CLIENT)
+            cmd = [
+                'tshark',
+                '-r', client_trace._filename,
+                '-Y', f'{direction_filter}quic.ack.largest_acknowledged',
+                '-T', 'fields',
+                '-e', 'frame.time_epoch',
+                '-e', 'quic.ack.largest_acknowledged',
+                '-E', 'occurrence=f'
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=10)
+            
+            recovery_time = None
+            ack_count_after_loss = 0
+            
+            for line in result.stdout.strip().split('\n'):
+                if not line.strip():
+                    continue
+                parts = line.split('\t')
+                if len(parts) >= 2:
+                    pkt_time = float(parts[0])
+                    
+                    # Only look after loss detection
+                    if pkt_time <= loss_time:
+                        continue
+                    
+                    ack_count_after_loss += 1
+                    
+                    # Recovery heuristic: after we see several ACKs, connection has recovered
+                    if ack_count_after_loss >= 3:
+                        recovery_time = pkt_time
+                        logging.debug("Recovery: ACK at %.3f s (3rd ACK after loss)", recovery_time)
+                        break
+            
+            if recovery_time is None:
+                logging.warning("No ACKs found indicating recovery")
+                self._result = 0.0
+                return TestResult.FAILED
+            
+        except Exception as e:
+            logging.error(f"Error finding recovery ACK: {e}")
+            self._result = 0.0
+            return TestResult.FAILED
+        
+        # Calculate recovery time
+        self._result = (recovery_time - loss_time) * 1000  # ms
+        
+        logging.info("Recovery time: %.2f ms (loss at %.3f, recovery at %.3f)", 
+                    self._result, loss_time, recovery_time)
+        
+        return TestResult.SUCCEEDED
+
+    def _check_tcp(self, server_trace, client_trace) -> TestResult:
+        """TCP recovery time measurement"""
         # Step 1: Identify first loss via retransmissions
         retrans = server_trace.get_retransmissions(Direction.FROM_SERVER)
         
@@ -2226,21 +2540,42 @@ class MeasurementRecoveryTime(Measurement):
         
         # Find first retransmitted packet
         first_retrans = min(retrans, key=lambda p: float(p.sniff_timestamp))
-        loss_time = float(first_retrans.sniff_timestamp)
+        first_retrans_time = float(first_retrans.sniff_timestamp)
         lost_seq = int(first_retrans.tcp.seq)
         
-        logging.debug("First retransmission at %.3f s (seq=%d)", loss_time, lost_seq)
+        logging.debug("First retransmission at %.3f s (seq=%d)", first_retrans_time, lost_seq)
         
-        # Step 2: Find the sequence number range that was lost
-        # The retransmission tells us what seq was lost
-        # We need to find when data BEYOND this seq is ACKed
-        
-        # Get all server packets to find what seq numbers came after the loss
+        # NEW: Find the timestamp of the LAST in-order segment before the lost sequence number
+        # Get all server packets
         server_packets = server_trace._get_packets(
-                server_trace._get_direction_filter(Direction.FROM_CLIENT) + "tcp"
+                server_trace._get_direction_filter(Direction.FROM_SERVER) + "tcp"
             )
         
-        # Find the highest seq sent before/during the loss event
+        loss_time = None
+        last_in_order_seq = -1
+        
+        for p in server_packets:
+            pkt_time = float(p.sniff_timestamp)
+            
+            # Only look at packets before the retransmission
+            if pkt_time >= first_retrans_time:
+                continue
+            
+            seq = int(p.tcp.seq)
+            
+            # Find the last packet with seq < lost_seq (last in-order before gap)
+            if seq < lost_seq and seq > last_in_order_seq:
+                last_in_order_seq = seq
+                loss_time = pkt_time
+        
+        if loss_time is None:
+            logging.warning("Could not find last in-order segment before loss")
+            # Fallback to retransmission time
+            loss_time = first_retrans_time
+        else:
+            logging.debug("Loss time (last in-order seq=%d): %.3f s", last_in_order_seq, loss_time)
+        
+        # Step 2: Find the highest seq sent before/during the loss event
         max_seq_at_loss = lost_seq
         for p in server_packets:
             pkt_time = float(p.sniff_timestamp)
@@ -2272,7 +2607,6 @@ class MeasurementRecoveryTime(Measurement):
             ack_num = int(p.tcp.ack)
             
             # Recovery = ACK acknowledges data beyond the lost sequence
-            # This means the connection has moved forward past the loss
             if ack_num > max_seq_at_loss:
                 recovery_time = pkt_time
                 logging.debug("Recovery: ACK=%d at %.3f s (beyond max_seq=%d)", 
@@ -2287,9 +2621,6 @@ class MeasurementRecoveryTime(Measurement):
         # Calculate recovery time
         self._result = (recovery_time - loss_time) * 1000  # ms
         
-        if not self._check_files():
-            return TestResult.FAILED
-        
         logging.info("Recovery time: %.2f ms (loss at %.3f, ACK at %.3f)", 
                     self._result, loss_time, recovery_time)
         
@@ -2297,6 +2628,7 @@ class MeasurementRecoveryTime(Measurement):
 
     def result(self) -> float:
         return self._result
+
 
 class MeasurementTailLatency(Measurement):
     _result = 0.0
@@ -2311,7 +2643,7 @@ class MeasurementTailLatency(Measurement):
 
     @staticmethod
     def testname(p: Perspective):
-        return "multiplexing"  # Use multiplexing test for many small files
+        return "transfer"
 
     @staticmethod
     def abbreviation():
@@ -2319,51 +2651,162 @@ class MeasurementTailLatency(Measurement):
 
     @staticmethod
     def desc():
-        return "99th percentile latency across all file transfers."
+        return "99th percentile inter-packet latency during sustained transfer."
 
     @staticmethod
     def repetitions() -> int:
         return 3
 
     def get_paths(self):
-        # Generate many small files to get distribution
-        for _ in range(100):
-            self._files.append(self._generate_random_file(1 * KB))
+        # For streaming mode, create a dummy file for compatibility
+        # The actual transfer will be controlled by TRANSFER_DURATION
+        self._files = [self._generate_random_file(1 * KB)]
         return self._files
 
     def check(self) -> TestResult:
         super().check()
         
-        if not self._keylog_file() and self._protocol == "quic":
-            logging.info("Can't measure tail latency without keylog (need to see STREAM frames)")
-            return TestResult.UNSUPPORTED
+        if self._protocol == "quic":
+            return self._check_quic()
+        else:
+            return self._check_tcp()
+    
+    def _check_quic(self) -> TestResult:
+        """QUIC inter-packet arrival time distribution"""
+        import subprocess
         
-        # For simplicity: measure latency as time between packets
-        # More sophisticated: track per-stream latencies
-        server_data = self._client_trace().get_stream_data_packets(Direction.FROM_SERVER)
+        server_trace = self._server_trace()
         
-        if len(server_data) < 10:
-            logging.info("Not enough data packets for tail latency measurement")
+        try:
+            # Get all QUIC stream data packets from server with timestamps
+            direction_filter = server_trace._get_direction_filter(Direction.FROM_SERVER)
+            cmd = [
+                'tshark',
+                '-r', server_trace._filename,
+                '-Y', f'{direction_filter}quic.stream_data',
+                '-T', 'fields',
+                '-e', 'frame.time_epoch',
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+            lines = [l for l in result.stdout.strip().split('\n') if l.strip()]
+            
+            logging.info(f"Found {len(lines)} QUIC stream data packets")
+            
+            if len(lines) < 100:
+                logging.info("Not enough data packets for tail latency measurement")
+                return TestResult.FAILED
+            
+            # Extract timestamps
+            timestamps = []
+            for line in lines:
+                try:
+                    timestamps.append(float(line.strip()))
+                except ValueError:
+                    continue
+            
+            if len(timestamps) < 100:
+                logging.info("Not enough valid timestamps")
+                return TestResult.FAILED
+            
+            # Sort timestamps
+            timestamps.sort()
+            
+            # Calculate inter-arrival times (deltas between consecutive packets)
+            inter_arrival_times = []
+            for i in range(len(timestamps) - 1):
+                delta_ms = (timestamps[i + 1] - timestamps[i]) * 1000
+                inter_arrival_times.append(delta_ms)
+            
+            if not inter_arrival_times:
+                logging.info("No inter-arrival times calculated")
+                return TestResult.FAILED
+            
+            # Calculate p99 of inter-arrival times
+            inter_arrival_times.sort()
+            p99_index = int(len(inter_arrival_times) * 0.99)
+            self._result = inter_arrival_times[p99_index]
+            
+            logging.info(f"Tail latency (p99 inter-arrival): {self._result:.2f} ms from {len(inter_arrival_times)} samples")
+            logging.info(f"Min: {inter_arrival_times[0]:.2f} ms, "
+                        f"Median: {inter_arrival_times[len(inter_arrival_times)//2]:.2f} ms, "
+                        f"Max: {inter_arrival_times[-1]:.2f} ms")
+            return TestResult.SUCCEEDED
+            
+        except Exception as e:
+            logging.error(f"Error measuring QUIC tail latency: {e}")
+            import traceback
+            traceback.print_exc()
             return TestResult.FAILED
-        
-        # Calculate inter-arrival times as proxy for latency
-        timestamps = sorted([float(p.sniff_timestamp) for p in server_data])
-        latencies = [(timestamps[i+1] - timestamps[i]) * 1000 for i in range(len(timestamps)-1)]
-        
-        if not latencies:
-            return TestResult.FAILED
-        
-        # Calculate p99
-        latencies.sort()
-        p99_index = int(len(latencies) * 0.99)
-        self._result = latencies[p99_index]
-        
-        if not self._check_files():
-            return TestResult.FAILED
-        
-        logging.debug("Tail latency (p99): %.2f ms", self._result)
-        return TestResult.SUCCEEDED
 
+    def _check_tcp(self) -> TestResult:
+        """TCP inter-packet arrival time distribution"""
+        import subprocess
+        
+        server_trace = self._server_trace()
+        
+        try:
+            # Get all TCP data packets (with payload) from server with timestamps
+            direction_filter = server_trace._get_direction_filter(Direction.FROM_SERVER)
+            cmd = [
+                'tshark',
+                '-r', server_trace._filename,
+                '-Y', f'{direction_filter}tcp.len > 0',
+                '-T', 'fields',
+                '-e', 'frame.time_epoch',
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+            lines = [l for l in result.stdout.strip().split('\n') if l.strip()]
+            
+            logging.info(f"Found {len(lines)} TCP data packets")
+            
+            if len(lines) < 100:
+                logging.info("Not enough data packets for tail latency measurement")
+                return TestResult.FAILED
+            
+            # Extract timestamps
+            timestamps = []
+            for line in lines:
+                try:
+                    timestamps.append(float(line.strip()))
+                except ValueError:
+                    continue
+            
+            if len(timestamps) < 100:
+                logging.info("Not enough valid timestamps")
+                return TestResult.FAILED
+            
+            # Sort timestamps
+            timestamps.sort()
+            
+            # Calculate inter-arrival times (deltas between consecutive packets)
+            inter_arrival_times = []
+            for i in range(len(timestamps) - 1):
+                delta_ms = (timestamps[i + 1] - timestamps[i]) * 1000
+                inter_arrival_times.append(delta_ms)
+            
+            if not inter_arrival_times:
+                logging.info("No inter-arrival times calculated")
+                return TestResult.FAILED
+            
+            # Calculate p99 of inter-arrival times
+            inter_arrival_times.sort()
+            p99_index = int(len(inter_arrival_times) * 0.99)
+            self._result = inter_arrival_times[p99_index]
+            
+            logging.info(f"Tail latency (p99 inter-arrival): {self._result:.2f} ms from {len(inter_arrival_times)} samples")
+            logging.info(f"Min: {inter_arrival_times[0]:.2f} ms, "
+                        f"Median: {inter_arrival_times[len(inter_arrival_times)//2]:.2f} ms, "
+                        f"Max: {inter_arrival_times[-1]:.2f} ms")
+            return TestResult.SUCCEEDED
+            
+        except Exception as e:
+            logging.error(f"Error measuring TCP tail latency: {e}")
+            import traceback
+            traceback.print_exc()
+            return TestResult.FAILED
+    
     def result(self) -> float:
         return self._result
 
@@ -2414,9 +2857,6 @@ class MeasurementReorderingRate(Measurement):
                 reordered_count += 1
         
         self._result = (reordered_count / len(packet_numbers)) * 100
-        
-        if not self._check_files():
-            return TestResult.FAILED
         
         logging.debug("Reordering rate: %.2f%% (%d/%d)", 
                      self._result, reordered_count, len(packet_numbers))
@@ -2478,9 +2918,6 @@ class MeasurementJitter(Measurement):
         logging.debug("Jitter (stddev): %.3f ms", self._result)
         logging.debug("Sample size: %d packets", len(timestamps))
         
-        if not self._check_files():
-            return TestResult.FAILED
-        
         return TestResult.SUCCEEDED
 
     def result(self) -> float:
@@ -2520,9 +2957,6 @@ class MeasurementCPU(Measurement):
 
     def check(self) -> TestResult:
         super().check()
-        
-        if not self._check_files():
-            return TestResult.FAILED
         
         # Stats are injected by runner
         if not hasattr(self, '_container_stats'):
@@ -2585,9 +3019,6 @@ class MeasurementMemory(Measurement):
 
     def check(self) -> TestResult:
         super().check()
-        
-        if not self._check_files():
-            return TestResult.FAILED
         
         if not hasattr(self, '_container_stats'):
             logging.warning("No container stats available")

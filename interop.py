@@ -202,6 +202,11 @@ class InteropRunner:
 
         testcases.generate_cert_chain(certs_dir.name)
 
+        transfer_duration = testcases.network_params.get('transfer_duration', 30)
+        bandwidth = testcases.network_params.get('bandwidth', '100Mbps')
+        if isinstance(transfer_duration, str):
+            transfer_duration = transfer_duration.strip('"')
+
         # check that the client is capable of returning UNSUPPORTED
         logging.debug("Checking compliance of %s client", name)
         cmd = (
@@ -213,11 +218,11 @@ class InteropRunner:
             "DOWNLOADS=" + downloads_dir.name + " "
             'SCENARIO="simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25" '
             "CLIENT=" + self._implementations[name]["image"] + " "
-            "SERVER="
-            + self._implementations[name]["image"]
-            + " "  # only needed so docker compose doesn't complain
+            "SERVER=" + self._implementations[name]["image"] + " "
+            'TRANSFER_DURATION="{}"' + " "
+            'BANDWIDTH="{}" '.format(bandwidth) +
             "docker compose --env-file empty.env up --timeout 0 --abort-on-container-exit -V sim client"
-        )
+        ).format(transfer_duration)
         output = subprocess.run(
             cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
         )
@@ -238,12 +243,12 @@ class InteropRunner:
             "CLIENT_LOGS=/dev/null "
             "WWW=" + www_dir.name + " "
             "DOWNLOADS=" + downloads_dir.name + " "
-            "CLIENT="
-            + self._implementations[name]["image"]
-            + " "  # only needed so docker compose doesn't complain
+            "CLIENT=" + self._implementations[name]["image"] + " "
             "SERVER=" + self._implementations[name]["image"] + " "
+            'TRANSFER_DURATION="{}"' + " "
+            'BANDWIDTH="{}" '.format(bandwidth) +
             "docker compose --env-file empty.env up -V server"
-        )
+        ).format(transfer_duration)
         output = subprocess.run(
             cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
         )
@@ -490,6 +495,10 @@ class InteropRunner:
             + str(testcase)
         )
 
+        transfer_duration = testcases.network_params.get('transfer_duration', 30)
+        bandwidth = testcases.network_params.get('bandwidth', '100Mbps')
+        if isinstance(transfer_duration, str):
+            transfer_duration = transfer_duration.strip('"')
         reqs = " ".join([testcase.urlprefix() + p for p in testcase.get_paths()])
         logging.debug("Requests: %s", reqs)
         port = "443" if self._protocol == "quic" else "80"
@@ -508,7 +517,9 @@ class InteropRunner:
             "CLIENT=" + self._implementations[client]["image"] + " "
             "SERVER=" + self._implementations[server]["image"] + " "
             'REQUESTS="' + reqs + '" '
-        ).format(testcase.scenario())
+            'TRANSFER_DURATION={}' + " "
+            'BANDWIDTH="{}" '.format(bandwidth)
+        ).format(testcase.scenario(), transfer_duration)
         params += " ".join(testcase.additional_envs())
         containers = "sim client server " + " ".join(testcase.additional_containers())
         cmd = (

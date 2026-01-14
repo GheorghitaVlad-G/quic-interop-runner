@@ -1,0 +1,21 @@
+Batch Measurement Run Summary
+================================================================================
+
+Timestamp: 20260110_034133
+Duration: 1:02:37.168619
+Configuration: {'protocol': 'quic', 'client': 'ngtcp2', 'server': 'nginx', 'delay': '15ms', 'bandwidth': '10Mbps', 'queue': '25', 'loss_rate': None, 'corrupt_rate': None, 'burst_size': None, 'jitter_variance': None, 'delay1': '15ms', 'delay2': '50ms', 'probability': '0.1', 'tcp_cross_traffic': False, 'udp_cross_traffic': False, 'crossdatarate': None, 'file_size': '10MB', 'protect_tcp_acks': False, 'log_dir_base': 'batch_logs', 'json_output': True, 'results_dir': 'batch_results', 'csv_file': 'measurements.csv'}
+
+Results:
+--------------------------------------------------------------------------------
+handshake_time: PASS - 74.47 (±0.24)
+ttfb: PASS - 109.31 (±0.57)
+transfer_time: PASS - 76687.71 (±1652.07)
+throughput: PASS - 1.31 (±0.03)
+goodput: PASS - 1096.83 (±24.49)
+retransmission_rate: PASS - 17.13 (±0.74)
+recovery_time: PASS - 7.78 (±3.02)
+tail_latency: PASS - 156.51 (±10.19)
+cpu_usage: PASS - client_cpu_mean: 2.22 (±0.34); client_cpu_peak: 3.78 (±1.06); server_cpu_mean: 0.73 (±0.13); server_cpu_peak: 1.20 (±0.27)
+memory_usage: PASS - client_mem_mean: 49.12 (±0.12); client_mem_peak: 54.67 (±0.09); server_mem_mean: 2.38 (±0.01); server_mem_peak: 2.53 (±0.13)
+
+Summary: 10/10 passed

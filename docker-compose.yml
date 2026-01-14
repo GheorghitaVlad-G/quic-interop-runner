@@ -41,6 +41,8 @@ services:
       - SSLKEYLOGFILE=/logs/keys.log
       - QLOGDIR=/logs/qlog/
       - TESTCASE=$TESTCASE_SERVER
+      - TRANSFER_DURATION=$TRANSFER_DURATION
+      - BANDWIDTH=$BANDWIDTH
     depends_on:
       - sim
     cap_add:
@@ -72,7 +74,9 @@ services:
       - SSLKEYLOGFILE=/logs/keys.log
       - QLOGDIR=/logs/qlog/
       - TESTCASE=$TESTCASE_CLIENT
+      - TRANSFER_DURATION=$TRANSFER_DURATION
       - REQUESTS=$REQUESTS
+      - BANDWIDTH=$BANDWIDTH
     depends_on:
       - sim
     cap_add:

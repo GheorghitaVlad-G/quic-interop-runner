@@ -1,0 +1,21 @@
+Batch Measurement Run Summary
+================================================================================
+
+Timestamp: 20260110_174736
+Duration: 0:20:02.361756
+Configuration: {'protocol': 'tcp', 'client': 'tcp-client', 'server': 'tcp-server', 'delay': '0ms', 'bandwidth': '1Gbps', 'queue': '5000', 'loss_rate': None, 'corrupt_rate': None, 'burst_size': None, 'jitter_variance': None, 'delay1': None, 'delay2': None, 'probability': None, 'tcp_cross_traffic': False, 'udp_cross_traffic': False, 'crossdatarate': None, 'file_size': '100MB', 'protect_tcp_acks': False, 'log_dir_base': 'batch_logs', 'json_output': True, 'results_dir': 'batch_results', 'csv_file': 'measurements.csv'}
+
+Results:
+--------------------------------------------------------------------------------
+handshake_time: PASS - 17.21 (±1.73)
+ttfb: PASS - 55.63 (±62.80)
+transfer_time: PASS - 4505.77 (±396.69)
+throughput: PASS - 237.83 (±32.35)
+goodput: PASS - 216048.88 (±30177.60)
+retransmission_rate: FAIL - FAILED
+recovery_time: PASS - 3.66 (±5.06)
+tail_latency: PASS - 2.27 (±0.36)
+cpu_usage: PASS - client_cpu_mean: 36.02 (±4.83); client_cpu_peak: 36.02 (±4.83); server_cpu_mean: 2.12 (±0.91); server_cpu_peak: 3.16 (±0.08)
+memory_usage: PASS - client_mem_mean: 5.08 (±0.64); client_mem_peak: 5.08 (±0.64); server_mem_mean: 9.14 (±0.67); server_mem_peak: 9.42 (±0.58)
+
+Summary: 9/10 passed

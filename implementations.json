@@ -124,5 +124,23 @@
     "url": "https://curl.se/",
     "role": "client",
     "protocol": "tcp"
+  },
+  "quic-go-streaming": {
+    "image": "quic-go-streaming:latest",
+    "url": "https://github.com/quic-go/quic-go",
+    "role": "both",
+    "protocol": "quic"
+  },
+  "msquic-streaming": {
+    "image": "msquic-streaming:latest",
+    "url": "https://github.com/microsoft/msquic",
+    "role": "both",
+    "protocol": "quic"
+  },
+  "quiche-streaming": {
+    "image": "quiche-streaming:latest",
+    "url": "https://github.com/cloudflare/quiche",
+    "role": "both",
+    "protocol": "quic"
   }
 }

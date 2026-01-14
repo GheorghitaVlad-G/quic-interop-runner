@@ -1,0 +1,21 @@
+Batch Measurement Run Summary
+================================================================================
+
+Timestamp: 20260110_013842
+Duration: 0:31:39.732141
+Configuration: {'protocol': 'quic', 'client': 'msquic', 'server': 'msquic', 'delay': '15ms', 'bandwidth': '10Mbps', 'queue': '25', 'loss_rate': None, 'corrupt_rate': None, 'burst_size': None, 'jitter_variance': None, 'delay1': '15ms', 'delay2': '50ms', 'probability': '0.1', 'tcp_cross_traffic': False, 'udp_cross_traffic': False, 'crossdatarate': None, 'file_size': '10MB', 'protect_tcp_acks': False, 'log_dir_base': 'batch_logs', 'json_output': True, 'results_dir': 'batch_results', 'csv_file': 'measurements.csv'}
+
+Results:
+--------------------------------------------------------------------------------
+handshake_time: PASS - 73.84 (±0.15)
+ttfb: PASS - 106.54 (±0.16)
+transfer_time: PASS - 19952.92 (±553.84)
+throughput: PASS - 5.06 (±0.20)
+goodput: PASS - 4323.52 (±198.84)
+retransmission_rate: PASS - 13.54 (±0.31)
+recovery_time: PASS - 16.90 (±2.58)
+tail_latency: PASS - 119.94 (±95.91)
+cpu_usage: PASS - client_cpu_mean: 1.59 (±0.18); client_cpu_peak: 2.86 (±0.63); server_cpu_mean: 2.06 (±0.08); server_cpu_peak: 3.31 (±0.10)
+memory_usage: PASS - client_mem_mean: 4.42 (±0.26); client_mem_peak: 5.45 (±0.18); server_mem_mean: 4.89 (±0.02); server_mem_peak: 4.96 (±0.11)
+
+Summary: 10/10 passed

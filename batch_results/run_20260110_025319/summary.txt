@@ -1,0 +1,21 @@
+Batch Measurement Run Summary
+================================================================================
+
+Timestamp: 20260110_025319
+Duration: 0:45:56.572250
+Configuration: {'protocol': 'quic', 'client': 'quiche', 'server': 'quiche', 'delay': '15ms', 'bandwidth': '10Mbps', 'queue': '25', 'loss_rate': None, 'corrupt_rate': None, 'burst_size': None, 'jitter_variance': None, 'delay1': '15ms', 'delay2': '50ms', 'probability': '0.1', 'tcp_cross_traffic': False, 'udp_cross_traffic': False, 'crossdatarate': None, 'file_size': '10MB', 'protect_tcp_acks': False, 'log_dir_base': 'batch_logs', 'json_output': True, 'results_dir': 'batch_results', 'csv_file': 'measurements.csv'}
+
+Results:
+--------------------------------------------------------------------------------
+handshake_time: PASS - 73.50 (±0.20)
+ttfb: PASS - 108.23 (±0.69)
+transfer_time: PASS - 12518.56 (±36.64)
+throughput: PASS - 8.30 (±0.03)
+goodput: PASS - 6708.61 (±51.26)
+retransmission_rate: PASS - 47.50 (±1.99)
+recovery_time: PASS - 17.78 (±0.06)
+tail_latency: PASS - 89.18 (±19.33)
+cpu_usage: PASS - client_cpu_mean: 18.68 (±1.33); client_cpu_peak: 23.29 (±2.40); server_cpu_mean: 19.02 (±0.50); server_cpu_peak: 30.99 (±4.17)
+memory_usage: PASS - client_mem_mean: 4.10 (±0.20); client_mem_peak: 5.09 (±0.11); server_mem_mean: 13.17 (±1.06); server_mem_peak: 15.89 (±0.09)
+
+Summary: 10/10 passed

@@ -182,6 +182,12 @@ def main():
             type=str,
             default=None,
         )
+        parser.add_argument(
+            "--transfer-duration",
+            help="Duration for streaming transfers in seconds (e.g., 30)",
+            type=int,
+            default=30,
+        )
         return parser.parse_args()
 
     args = get_args()
@@ -213,6 +219,7 @@ def main():
         'delay1': args.delay1,
         'delay2': args.delay2,
         'probability': args.probability,
+        'transfer_duration': args.transfer_duration,
     })
 
     protocol = args.protocol

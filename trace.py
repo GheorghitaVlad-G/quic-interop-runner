@@ -331,17 +331,141 @@ class TraceAnalyzer:
         For TCP: uses tcp.analysis.retransmission
         """
         packets = []
-        filter_str = self._get_direction_filter(direction)
         
         if self._protocol == "quic":
-            # QUIC retransmissions detected by Wireshark
-            filter_str += "(quic && (tcp.analysis.retransmission || tcp.analysis.fast_retransmission))"
+            import subprocess
+            
+            direction_filter = self._get_direction_filter(direction)
+            
+            # Build tshark filter
+            if direction_filter:
+                base_filter = f"{direction_filter}quic.stream.stream_id"
+            else:
+                base_filter = "quic.stream.stream_id"
+            
+            # Try to get stream data to calculate lengths
+            cmd = [
+                'tshark',
+                '-r', self._filename,
+                '-Y', base_filter,
+                '-T', 'fields',
+                '-e', 'frame.number',
+                '-e', 'quic.stream.stream_id',
+                '-e', 'quic.stream.offset',
+                '-e', 'quic.stream_data',
+                '-E', 'separator=|',
+                '-E', 'occurrence=a'
+            ]
+            
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+                lines = [l for l in result.stdout.strip().split('\n') if l.strip()]
+                
+                logging.info(f"Found {len(lines)} lines with QUIC stream data")
+                
+                if not lines:
+                    logging.warning("No QUIC stream data found")
+                    return packets
+                
+                # Track seen data ranges per stream
+                seen_ranges = {}  # stream_id -> list of (offset, offset+length)
+                retrans_frame_numbers = set()
+                processed_count = 0
+                skipped_no_data = 0
+                
+                for line in lines:
+                    parts = line.split('|')
+                    if len(parts) < 4:
+                        continue
+                    
+                    try:
+                        frame_num = int(parts[0])
+                        
+                        # Handle multiple streams per packet (comma-separated)
+                        stream_ids = [s.strip() for s in parts[1].split(',') if s.strip()]
+                        offsets = [s.strip() for s in parts[2].split(',') if s.strip()]
+                        stream_datas = [s.strip() for s in parts[3].split(',') if s.strip()]
+                        
+                        if not stream_ids:
+                            continue
+                        
+                        # Process each stream frame in this packet
+                        for idx, stream_id_str in enumerate(stream_ids):
+                            stream_id = int(stream_id_str)
+                            
+                            # Get offset (may be empty for offset 0)
+                            if idx < len(offsets) and offsets[idx]:
+                                offset = int(offsets[idx])
+                            else:
+                                offset = 0
+                            
+                            # Calculate length from hex stream data
+                            if idx < len(stream_datas) and stream_datas[idx]:
+                                # Stream data is in hex format like "6162636465..."
+                                # Each byte is 2 hex chars, so length = len(hex_string) / 2
+                                hex_data = stream_datas[idx].replace(':', '')
+                                length = len(hex_data) // 2
+                            else:
+                                skipped_no_data += 1
+                                continue
+                            
+                            if length == 0:
+                                continue
+                            
+                            processed_count += 1
+                            
+                            # Initialize stream tracking
+                            if stream_id not in seen_ranges:
+                                seen_ranges[stream_id] = []
+                            
+                            start = offset
+                            end = offset + length
+                            
+                            # Check for overlap with previously seen ranges
+                            is_retransmission = False
+                            for seen_start, seen_end in seen_ranges[stream_id]:
+                                if start < seen_end and end > seen_start:
+                                    is_retransmission = True
+                                    retrans_frame_numbers.add(frame_num)
+                                    if len(retrans_frame_numbers) <= 5:
+                                        logging.info(f"Retransmission: frame={frame_num}, stream={stream_id}, "
+                                                f"offset=[{offset}, {offset+length}), overlaps [{seen_start}, {seen_end})")
+                                    break
+                            
+                            if not is_retransmission:
+                                seen_ranges[stream_id].append((start, end))
+                    
+                    except (ValueError, IndexError) as e:
+                        logging.debug(f"Error parsing line '{line[:100]}': {e}")
+                        continue
+                
+                logging.info(f"Processed {processed_count} stream data frames, skipped {skipped_no_data} without data")
+                logging.info(f"Found {len(retrans_frame_numbers)} frames with retransmissions across {len(seen_ranges)} streams")
+                
+                # Fetch actual packet objects for retransmission frames
+                if retrans_frame_numbers:
+                    frame_nums = sorted(list(retrans_frame_numbers))
+                    chunk_size = 500
+                    for i in range(0, len(frame_nums), chunk_size):
+                        chunk = frame_nums[i:i+chunk_size]
+                        frame_filter = " or ".join([f"frame.number == {num}" for num in chunk])
+                        chunk_packets = self._get_packets(frame_filter)
+                        packets.extend(chunk_packets)
+                    
+                    logging.info(f"Retrieved {len(packets)} retransmission packet objects")
+                
+            except subprocess.CalledProcessError as e:
+                logging.error(f"tshark command failed: {e.stderr}")
+            except Exception as e:
+                logging.error(f"Error processing QUIC retransmissions: {e}")
         else:
-            # TCP retransmissions
-            filter_str += "tcp.analysis.retransmission"
-        
-        for packet in self._get_packets(filter_str):
-            packets.append(packet)
+            tcp_filter = self._get_direction_filter(direction)
+            if tcp_filter:
+                full_filter = f"{tcp_filter}tcp.analysis.retransmission"
+            else:
+                full_filter = "tcp.analysis.retransmission"
+            
+            packets = self._get_packets(full_filter)
         
         return packets
 
@@ -380,9 +504,14 @@ class TraceAnalyzer:
         packets = []
         
         if self._protocol == "quic":
-            for p in self.get_1rtt(direction):
-                if hasattr(p, "stream_data_length") and int(p.stream_data_length) > 0:
-                    packets.append(p)
+            # Use the display filter to get QUIC packets with stream data
+            direction_filter = self._get_direction_filter(direction)
+            if direction_filter:
+                filter_str = f"{direction_filter}quic.stream_data"
+            else:
+                filter_str = "quic.stream_data"
+            
+            packets = self._get_packets(filter_str)
         else:  # TCP
             filter_str = self._get_direction_filter(direction) + "tcp.len > 0"
             packets = self._get_packets(filter_str)

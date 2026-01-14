@@ -21,9 +21,9 @@ CONFIG = {
     'server': 'tcp-server',
     
     # Network parameters
-    'delay': '15ms',
-    'bandwidth': '10Mbps',
-    'queue': '25',
+    'delay': '0ms',
+    'bandwidth': '1Gbps',
+    'queue': '5000',
     
     # Loss/corruption (set to None to disable)
     'loss_rate': None,  # e.g., 3 for 3%
@@ -41,11 +41,11 @@ CONFIG = {
     # Cross traffic (set to False to disable)
     'tcp_cross_traffic': False,
     'udp_cross_traffic': False,
-    'crossdatarate': None,  # e.g., '8Mbps'
+    'crossdatarate': None,  # e.g., '8Mbps', mandatory for UDP cross traffic
     
     # Other
-    'file_size': '10MB',  # e.g., '10MB'
-    'protect_tcp_acks': False,
+    'file_size': '100MB',  # e.g., '10MB'
+    'protect_tcp_acks': False, # Only for tcp
     
     # Output
     'log_dir_base': 'batch_logs',  # Base directory for logs
@@ -61,18 +61,14 @@ MEASUREMENTS = [
     'transfer_time',
     'throughput',
     'goodput',
-    'retransmission_rate',  # Uncomment if using loss
-    'recovery_time',         # Uncomment if using loss
-    # 'reordering_rate',       # Uncomment for multipath
-    # 'jitter',                # Uncomment if using jitter
+    'retransmission_rate',
+    'recovery_time',
+    # 'reordering_rate',
+    # 'jitter',
     'tail_latency',
     'cpu_usage',
     'memory_usage',
 ]
-
-# ============================================================================
-# Script logic - Don't edit below unless you know what you're doing
-# ============================================================================
 
 def build_command(measurement: str, log_dir: str, json_file: Optional[str] = None) -> list:
     """Build the run.py command for a measurement."""
@@ -363,7 +359,7 @@ def main():
     if CONFIG['jitter_variance']:
         print(f"  Jitter: {CONFIG['jitter_variance']}")
     if CONFIG['delay1'] and CONFIG['delay2']:
-        print(f"  Multipath: {CONFIG['delay1']}/{CONFIG['delay2']} (p={CONFIG['probability']})")
+        print(f"  Multipath Reordering: {CONFIG['delay1']}/{CONFIG['delay2']} (p={CONFIG['probability']})")
     
     print(f"\nMeasurements to run ({len(MEASUREMENTS)}):")
     for m in MEASUREMENTS:
