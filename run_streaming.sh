@@ -136,6 +136,7 @@ services:
       - ${CERTS}:/certs:ro
     environment:
       - ROLE=server
+      - PROTOCOL=tcp
       - TRANSFER_DURATION=${TRANSFER_DURATION:-10}
       - SSLKEYLOGFILE=/logs/keys.log
     cap_add:
@@ -156,6 +157,7 @@ services:
       - ${CERTS}:/certs:ro
     environment:
       - ROLE=client
+      - PROTOCOL=tcp
       - TRANSFER_DURATION=${TRANSFER_DURATION:-10}
       - SSLKEYLOGFILE=/logs/keys.log
     depends_on:
